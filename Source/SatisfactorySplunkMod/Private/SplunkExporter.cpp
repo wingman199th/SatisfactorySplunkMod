@@ -262,9 +262,99 @@ void ASplunkExporter::CollectProductionData()
 
 void ASplunkExporter::CollectPowerData()
 {
-    // Power circuit data collection - simplified version
-    // Full implementation would require hooking into the power subsystem
-    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Power data collection (placeholder)"));
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    // Get power subsystem
+    AFGBuildableSubsystem* BuildableSubsystem = AFGBuildableSubsystem::Get(World);
+    if (!BuildableSubsystem) return;
+
+    // Collect power generator data
+    for (TActorIterator<AFGBuildablePowerGenerator> ActorItr(World); ActorItr; ++ActorItr)
+    {
+        AFGBuildablePowerGenerator* Generator = *ActorItr;
+        if (!Generator || !Generator->IsValidLowLevel()) continue;
+
+        TSharedPtr<FJsonObject> EventObject = CreateBaseEvent(TEXT("satisfactory:power:generator"));
+        TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
+        
+        EventData->SetStringField(TEXT("generator_type"), Generator->GetClass()->GetName());
+        EventData->SetStringField(TEXT("generator_id"), Generator->GetName());
+        EventData->SetNumberField(TEXT("power_production"), Generator->GetPowerProduction());
+        EventData->SetNumberField(TEXT("max_power_production"), Generator->GetMaxPowerProduction());
+        EventData->SetNumberField(TEXT("efficiency"), Generator->GetProductionEfficiency());
+        EventData->SetBoolField(TEXT("is_producing"), Generator->IsProducing());
+        
+        // Location
+        FVector Location = Generator->GetActorLocation();
+        EventData->SetNumberField(TEXT("location_x"), Location.X);
+        EventData->SetNumberField(TEXT("location_y"), Location.Y);
+        EventData->SetNumberField(TEXT("location_z"), Location.Z);
+        
+        // Fuel data for fuel-powered generators
+        if (AFGBuildablePowerGeneratorFuel* FuelGenerator = Cast<AFGBuildablePowerGeneratorFuel>(Generator))
+        {
+            UFGInventoryComponent* FuelInventory = FuelGenerator->GetFuelInventory();
+            if (FuelInventory)
+            {
+                float TotalFuelEnergy = 0.0f;
+                int32 FuelStacks = 0;
+                
+                for (int32 i = 0; i < FuelInventory->GetSizeLinear(); i++)
+                {
+                    FInventoryStack Stack;
+                    if (FuelInventory->GetStackFromIndex(i, Stack) && !Stack.Item.ItemClass.IsNull())
+                    {
+                        FuelStacks++;
+                        UFGItemDescriptor* ItemDesc = Stack.Item.ItemClass->GetDefaultObject<UFGItemDescriptor>();
+                        
+                        // Get energy value based on fuel type
+                        float EnergyValue = 100.0f; // Default
+                        if (UFGItemDescriptorNuclearFuel* NuclearFuel = Cast<UFGItemDescriptorNuclearFuel>(ItemDesc))
+                        {
+                            EnergyValue = NuclearFuel->GetEnergyValue();
+                        }
+                        else if (UFGItemDescriptorBiomass* BiomassFuel = Cast<UFGItemDescriptorBiomass>(ItemDesc))
+                        {
+                            EnergyValue = BiomassFuel->GetEnergyValue();
+                        }
+                        
+                        TotalFuelEnergy += EnergyValue * Stack.NumItems;
+                    }
+                }
+                
+                EventData->SetNumberField(TEXT("fuel_energy_available"), TotalFuelEnergy);
+                EventData->SetNumberField(TEXT("fuel_stacks"), FuelStacks);
+            }
+        }
+        
+        EventObject->SetObjectField(TEXT("event"), EventData);
+        AddEventToBuffer(EventObject);
+    }
+
+    // Collect power circuit data
+    TArray<AFGPowerCircuit*> PowerCircuits;
+    // Note: You'll need to get power circuits from the power subsystem
+    // This is a simplified version - you may need to access the subsystem differently
+    
+    for (AFGPowerCircuit* Circuit : PowerCircuits)
+    {
+        if (!Circuit) continue;
+        
+        TSharedPtr<FJsonObject> EventObject = CreateBaseEvent(TEXT("satisfactory:power:circuit"));
+        TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
+        
+        EventData->SetStringField(TEXT("circuit_id"), FString::Printf(TEXT("Circuit_%d"), Circuit->GetCircuitID()));
+        EventData->SetNumberField(TEXT("power_production"), Circuit->GetPowerProduction());
+        EventData->SetNumberField(TEXT("power_consumption"), Circuit->GetPowerConsumption());
+        EventData->SetNumberField(TEXT("power_capacity"), Circuit->GetPowerCapacity());
+        EventData->SetNumberField(TEXT("power_utilization"), Circuit->GetPowerUtilization());
+        EventData->SetBoolField(TEXT("has_power"), Circuit->HasPower());
+        EventData->SetBoolField(TEXT("is_fuse_triggered"), Circuit->IsFuseTriggered());
+        
+        EventObject->SetObjectField(TEXT("event"), EventData);
+        AddEventToBuffer(EventObject);
+    }
 }
 
 void ASplunkExporter::CollectAllVehicleData()

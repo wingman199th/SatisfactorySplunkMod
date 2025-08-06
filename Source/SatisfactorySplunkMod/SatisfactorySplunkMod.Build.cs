@@ -1,30 +1,46 @@
+using UnrealBuildTool;
+
+public class SatisfactorySplunkMod : ModuleRules
 {
-    "FileVersion": 3,
-    "Version": 1,
-    "VersionName": "1.0.0",
-    "FriendlyName": "Satisfactory Splunk Exporter",
-    "Description": "Exports production, vehicle, and player data to Splunk for analytics",
-    "Category": "Modding",
-    "CreatedBy": "YourName",
-    "CreatedByURL": "",
-    "DocsURL": "",
-    "MarketplaceURL": "",
-    "SupportURL": "",
-    "CanContainContent": true,
-    "IsBetaVersion": false,
-    "IsExperimentalVersion": false,
-    "Installed": false,
-    "Modules": [
-        {
-            "Name": "SatisfactorySplunkMod",
-            "Type": "Runtime",
-            "LoadingPhase": "PostDefault"
-        }
-    ],
-    "Plugins": [
-        {
-            "Name": "SML",
-            "Enabled": true
-        }
-    ]
+    public SatisfactorySplunkMod(ReadOnlyTargetRules Target) : base(Target)
+    {
+        PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+        
+        PublicIncludePaths.AddRange(
+            new string[] {
+            }
+        );
+
+        PrivateIncludePaths.AddRange(
+            new string[] {
+            }
+        );
+
+        PublicDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "Core",
+                "CoreUObject",
+                "Engine",
+                "Http",
+                "Json",
+                "JsonUtilities",
+                "FactoryGame"
+            }
+        );
+
+        PrivateDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "Slate",
+                "SlateCore"
+            }
+        );
+
+        DynamicallyLoadedModuleNames.AddRange(
+            new string[]
+            {
+            }
+        );
+    }
 }
