@@ -7,10 +7,10 @@ IMPLEMENT_MODULE(FSatisfactorySplunkModModule, SatisfactorySplunkMod);
 
 void FSatisfactorySplunkModModule::StartupModule()
 {
-    UE_LOG(LogSatisfactorySplunkMod, Warning, TEXT("Satisfactory Splunk Mod: Module Started"));
+    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("Satisfactory Splunk Mod: Module Started"));
 }
 
 void FSatisfactorySplunkModModule::ShutdownModule()
 {
-    UE_LOG(LogSatisfactorySplunkMod, Warning, TEXT("Satisfactory Splunk Mod: Module Shutdown"));
+    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("Satisfactory Splunk Mod: Module Shutdown"));
 }

@@ -17,9 +17,9 @@ ASplunkExporter::ASplunkExporter()
 void ASplunkExporter::BeginPlay()
 {
     Super::BeginPlay();
-    
-    UE_LOG(LogSatisfactorySplunkMod, Warning, TEXT("SplunkExporter: Starting up"));
-    
+
+    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Starting up"));
+
     // Auto-start data collection
     StartDataCollection();
 }
@@ -39,28 +39,31 @@ void ASplunkExporter::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void ASplunkExporter::StartDataCollection()
 {
-    if (GetWorld() && !bIsCollecting)
+    UWorld* World = GetWorld();
+    if (World && !bIsCollecting)
     {
-        GetWorldTimerManager().SetTimer(
+        FTimerManager& TimerManager = World->GetTimerManager();
+        TimerManager.SetTimer(
             DataCollectionTimer,
             this,
             &ASplunkExporter::CollectAndSendData,
             CollectionInterval,
             true
         );
-        
+
         bIsCollecting = true;
-        UE_LOG(LogSatisfactorySplunkMod, Warning, TEXT("SplunkExporter: Data collection started (interval: %.1fs)"), CollectionInterval);
+        UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data collection started (interval: %.1fs)"), CollectionInterval);
     }
 }
 
 void ASplunkExporter::StopDataCollection()
 {
-    if (GetWorld() && bIsCollecting)
+    UWorld* World = GetWorld();
+    if (World && bIsCollecting)
     {
-        GetWorldTimerManager().ClearTimer(DataCollectionTimer);
+        World->GetTimerManager().ClearTimer(DataCollectionTimer);
         bIsCollecting = false;
-        UE_LOG(LogSatisfactorySplunkMod, Warning, TEXT("SplunkExporter: Data collection stopped"));
+        UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data collection stopped"));
     }
 }
 
@@ -182,22 +185,28 @@ void ASplunkExporter::CollectProductionData()
             if (Recipe)
             {
                 EventData->SetStringField(TEXT("recipe_name"), Recipe->GetDisplayName().ToString());
-                
+
                 TArray<FItemAmount> Products = Recipe->GetProducts();
                 TArray<FItemAmount> Ingredients = Recipe->GetIngredients();
-                
-                if (Products.Num() > 0)
+
+                if (Products.Num() > 0 && Products[0].ItemClass)
                 {
-                    EventData->SetStringField(TEXT("output_item"), 
-                        Products[0].ItemClass->GetDefaultObject<UFGItemDescriptor>()->GetDisplayName().ToString());
-                    EventData->SetNumberField(TEXT("output_rate"), Products[0].Amount);
+                    UFGItemDescriptor* ProductDesc = Products[0].ItemClass->GetDefaultObject<UFGItemDescriptor>();
+                    if (ProductDesc)
+                    {
+                        EventData->SetStringField(TEXT("output_item"), ProductDesc->GetDisplayName().ToString());
+                        EventData->SetNumberField(TEXT("output_rate"), Products[0].Amount);
+                    }
                 }
-                
-                if (Ingredients.Num() > 0)
+
+                if (Ingredients.Num() > 0 && Ingredients[0].ItemClass)
                 {
-                    EventData->SetStringField(TEXT("input_item"), 
-                        Ingredients[0].ItemClass->GetDefaultObject<UFGItemDescriptor>()->GetDisplayName().ToString());
-                    EventData->SetNumberField(TEXT("input_rate"), Ingredients[0].Amount);
+                    UFGItemDescriptor* IngredientDesc = Ingredients[0].ItemClass->GetDefaultObject<UFGItemDescriptor>();
+                    if (IngredientDesc)
+                    {
+                        EventData->SetStringField(TEXT("input_item"), IngredientDesc->GetDisplayName().ToString());
+                        EventData->SetNumberField(TEXT("input_rate"), Ingredients[0].Amount);
+                    }
                 }
                 
                 // Handle multi-input recipes
@@ -206,13 +215,22 @@ void ASplunkExporter::CollectProductionData()
                     TArray<TSharedPtr<FJsonValue>> SecondaryInputs;
                     for (int32 i = 1; i < Ingredients.Num(); i++)
                     {
-                        TSharedPtr<FJsonObject> InputObj = MakeShareable(new FJsonObject);
-                        InputObj->SetStringField(TEXT("item"), 
-                            Ingredients[i].ItemClass->GetDefaultObject<UFGItemDescriptor>()->GetDisplayName().ToString());
-                        InputObj->SetNumberField(TEXT("rate"), Ingredients[i].Amount);
-                        SecondaryInputs.Add(MakeShareable(new FJsonValueObject(InputObj)));
+                        if (Ingredients[i].ItemClass)
+                        {
+                            UFGItemDescriptor* IngredientDesc = Ingredients[i].ItemClass->GetDefaultObject<UFGItemDescriptor>();
+                            if (IngredientDesc)
+                            {
+                                TSharedPtr<FJsonObject> InputObj = MakeShareable(new FJsonObject);
+                                InputObj->SetStringField(TEXT("item"), IngredientDesc->GetDisplayName().ToString());
+                                InputObj->SetNumberField(TEXT("rate"), Ingredients[i].Amount);
+                                SecondaryInputs.Add(MakeShareable(new FJsonValueObject(InputObj)));
+                            }
+                        }
                     }
-                    EventData->SetArrayField(TEXT("secondary_inputs"), SecondaryInputs);
+                    if (SecondaryInputs.Num() > 0)
+                    {
+                        EventData->SetArrayField(TEXT("secondary_inputs"), SecondaryInputs);
+                    }
                 }
             }
         }
@@ -246,8 +264,11 @@ void ASplunkExporter::CollectProductionData()
         TSubclassOf<UFGResourceDescriptor> ResourceClass = Extractor->GetResourceClass();
         if (ResourceClass)
         {
-            EventData->SetStringField(TEXT("resource_type"), 
-                ResourceClass->GetDefaultObject<UFGResourceDescriptor>()->GetDisplayName().ToString());
+            UFGResourceDescriptor* ResourceDesc = ResourceClass->GetDefaultObject<UFGResourceDescriptor>();
+            if (ResourceDesc)
+            {
+                EventData->SetStringField(TEXT("resource_type"), ResourceDesc->GetDisplayName().ToString());
+            }
         }
         
         FVector Location = Extractor->GetActorLocation();
@@ -332,29 +353,9 @@ void ASplunkExporter::CollectPowerData()
         AddEventToBuffer(EventObject);
     }
 
-    // Collect power circuit data
-    TArray<AFGPowerCircuit*> PowerCircuits;
-    // Note: You'll need to get power circuits from the power subsystem
-    // This is a simplified version - you may need to access the subsystem differently
-    
-    for (AFGPowerCircuit* Circuit : PowerCircuits)
-    {
-        if (!Circuit) continue;
-        
-        TSharedPtr<FJsonObject> EventObject = CreateBaseEvent(TEXT("satisfactory:power:circuit"));
-        TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
-        
-        EventData->SetStringField(TEXT("circuit_id"), FString::Printf(TEXT("Circuit_%d"), Circuit->GetCircuitID()));
-        EventData->SetNumberField(TEXT("power_production"), Circuit->GetPowerProduction());
-        EventData->SetNumberField(TEXT("power_consumption"), Circuit->GetPowerConsumption());
-        EventData->SetNumberField(TEXT("power_capacity"), Circuit->GetPowerCapacity());
-        EventData->SetNumberField(TEXT("power_utilization"), Circuit->GetPowerUtilization());
-        EventData->SetBoolField(TEXT("has_power"), Circuit->HasPower());
-        EventData->SetBoolField(TEXT("is_fuse_triggered"), Circuit->IsFuseTriggered());
-        
-        EventObject->SetObjectField(TEXT("event"), EventData);
-        AddEventToBuffer(EventObject);
-    }
+    // TODO: Implement power circuit collection
+    // Power circuits need to be retrieved from the power subsystem
+    // Current API for accessing power circuits is unclear and needs investigation
 }
 
 void ASplunkExporter::CollectAllVehicleData()
