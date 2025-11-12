@@ -114,7 +114,7 @@ private:
     float MetricsInterval = 1.0f;  // Collect metrics every 1 second
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Metrics Settings", meta = (AllowPrivateAccess = "true"))
-    float BufferFlushInterval = 30.0f;  // Flush buffer every 30 seconds
+    float BufferFlushInterval = 1.0f;  // Flush buffer every 1 second (real-time streaming)
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Metrics Settings", meta = (AllowPrivateAccess = "true"))
     bool bUseMetricsMode = true;  // Use fast metrics mode instead of detailed events
