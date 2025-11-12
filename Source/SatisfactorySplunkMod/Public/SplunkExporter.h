@@ -63,8 +63,15 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
     void SendBufferedData();
 
+    UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
+    void CollectMetrics();
+
 private:
-    // Data collection methods
+    // Metrics collection (fast, aggregated)
+    void CollectAggregateMetrics();
+    void CheckAndFlushBuffer();
+
+    // Data collection methods (legacy/detailed)
     void CollectProductionData();
     void CollectPowerData();
     void CollectAllVehicleData();
@@ -85,24 +92,38 @@ private:
     TSharedPtr<FJsonObject> CreateBaseEvent(const FString& SourceType);
 
 private:
-    // Timer for data collection
-    FTimerHandle DataCollectionTimer;
-    
+    // Timers
+    FTimerHandle MetricsCollectionTimer;
+    FTimerHandle BufferFlushTimer;
+    FTimerHandle DataCollectionTimer;  // Legacy timer for detailed events
+
     // Data buffer for batching
     TArray<TSharedPtr<FJsonObject>> DataBuffer;
-    
+
+    // Timestamps
+    FDateTime LastBufferFlush;
+
     // Configuration properties
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Splunk Configuration", meta = (AllowPrivateAccess = "true"))
     FString SplunkURL = TEXT("https://your-splunk-instance:8088/services/collector");
-    
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Splunk Configuration", meta = (AllowPrivateAccess = "true"))
     FString HECToken = TEXT("your-hec-token-here");
-    
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Metrics Settings", meta = (AllowPrivateAccess = "true"))
+    float MetricsInterval = 1.0f;  // Collect metrics every 1 second
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Metrics Settings", meta = (AllowPrivateAccess = "true"))
+    float BufferFlushInterval = 30.0f;  // Flush buffer every 30 seconds
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Metrics Settings", meta = (AllowPrivateAccess = "true"))
+    bool bUseMetricsMode = true;  // Use fast metrics mode instead of detailed events
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Settings", meta = (AllowPrivateAccess = "true"))
-    float CollectionInterval = 30.0f;
-    
+    float CollectionInterval = 30.0f;  // Legacy: for detailed events mode
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Settings", meta = (AllowPrivateAccess = "true"))
-    int32 BatchSize = 10;
+    int32 BatchSize = 10;  // Legacy: not used in metrics mode
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Settings", meta = (AllowPrivateAccess = "true"))
     bool bCollectProductionData = true;

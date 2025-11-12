@@ -8,10 +8,11 @@ ASplunkExporter::ASplunkExporter()
 {
     PrimaryActorTick.bCanEverTick = false;
     bReplicates = false;
-    
+
     EventsInBuffer = 0;
     EventsSentTotal = 0;
     bIsCollecting = false;
+    LastBufferFlush = FDateTime::Now();
 }
 
 void ASplunkExporter::BeginPlay()
@@ -43,16 +44,46 @@ void ASplunkExporter::StartDataCollection()
     if (World && !bIsCollecting)
     {
         FTimerManager& TimerManager = World->GetTimerManager();
-        TimerManager.SetTimer(
-            DataCollectionTimer,
-            this,
-            &ASplunkExporter::CollectAndSendData,
-            CollectionInterval,
-            true
-        );
+
+        if (bUseMetricsMode)
+        {
+            // Fast metrics collection every 1 second (or configured interval)
+            TimerManager.SetTimer(
+                MetricsCollectionTimer,
+                this,
+                &ASplunkExporter::CollectMetrics,
+                MetricsInterval,
+                true
+            );
+
+            // Time-based buffer flush every 30 seconds (or configured interval)
+            TimerManager.SetTimer(
+                BufferFlushTimer,
+                this,
+                &ASplunkExporter::CheckAndFlushBuffer,
+                BufferFlushInterval,
+                true
+            );
+
+            UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Metrics mode started (collect: %.1fs, flush: %.1fs)"),
+                MetricsInterval, BufferFlushInterval);
+        }
+        else
+        {
+            // Legacy mode: detailed events
+            TimerManager.SetTimer(
+                DataCollectionTimer,
+                this,
+                &ASplunkExporter::CollectAndSendData,
+                CollectionInterval,
+                true
+            );
+
+            UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Events mode started (interval: %.1fs)"), CollectionInterval);
+        }
 
         bIsCollecting = true;
-        UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data collection started (interval: %.1fs)"), CollectionInterval);
+        LastBufferFlush = FDateTime::Now();
     }
 }
 
@@ -61,7 +92,10 @@ void ASplunkExporter::StopDataCollection()
     UWorld* World = GetWorld();
     if (World && bIsCollecting)
     {
-        World->GetTimerManager().ClearTimer(DataCollectionTimer);
+        FTimerManager& TimerManager = World->GetTimerManager();
+        TimerManager.ClearTimer(MetricsCollectionTimer);
+        TimerManager.ClearTimer(BufferFlushTimer);
+        TimerManager.ClearTimer(DataCollectionTimer);
         bIsCollecting = false;
         UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data collection stopped"));
     }
@@ -778,35 +812,179 @@ void ASplunkExporter::CollectFactoryLayoutData()
 
     TSharedPtr<FJsonObject> LayoutEvent = CreateBaseEvent(TEXT("satisfactory:factory:layout"));
     TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
-    
+
     EventData->SetStringField(TEXT("event_type"), TEXT("factory_layout"));
-    
+
     TArray<TSharedPtr<FJsonValue>> BuildingsArray;
-    
+
     for (TActorIterator<AFGBuildable> ActorItr(World); ActorItr; ++ActorItr)
     {
         AFGBuildable* Building = *ActorItr;
         if (!Building) continue;
-        
+
         TSharedPtr<FJsonObject> BuildingData = MakeShareable(new FJsonObject);
         BuildingData->SetStringField(TEXT("building_type"), Building->GetClass()->GetName());
         BuildingData->SetStringField(TEXT("building_id"), Building->GetName());
-        
+
         FVector Location = Building->GetActorLocation();
         BuildingData->SetNumberField(TEXT("x"), Location.X);
         BuildingData->SetNumberField(TEXT("y"), Location.Y);
         BuildingData->SetNumberField(TEXT("z"), Location.Z);
-        
+
         FRotator Rotation = Building->GetActorRotation();
         BuildingData->SetNumberField(TEXT("rotation"), Rotation.Yaw);
-        
+
         BuildingsArray.Add(MakeShareable(new FJsonValueObject(BuildingData)));
     }
-    
+
     EventData->SetArrayField(TEXT("buildings"), BuildingsArray);
     LayoutEvent->SetObjectField(TEXT("event"), EventData);
-    
+
     SendLayoutDataToSplunk(LayoutEvent);
+}
+
+// ===== METRICS MODE METHODS =====
+
+void ASplunkExporter::CollectMetrics()
+{
+    if (!GetWorld())
+    {
+        return;
+    }
+
+    CollectAggregateMetrics();
+}
+
+void ASplunkExporter::CollectAggregateMetrics()
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    // Create metrics event using Splunk metrics format
+    TSharedPtr<FJsonObject> MetricsEvent = MakeShareable(new FJsonObject);
+    TSharedPtr<FJsonObject> Fields = MakeShareable(new FJsonObject);
+
+    double Timestamp = FDateTime::Now().ToUnixTimestamp();
+    MetricsEvent->SetStringField(TEXT("time"), FString::Printf(TEXT("%.0f"), Timestamp));
+    MetricsEvent->SetStringField(TEXT("event"), TEXT("metric"));
+    MetricsEvent->SetStringField(TEXT("source"), TEXT("satisfactory-mod"));
+    MetricsEvent->SetStringField(TEXT("sourcetype"), TEXT("satisfactory:metrics"));
+
+    // Aggregate metrics
+    float TotalPowerConsumption = 0.0f;
+    float TotalPowerProduction = 0.0f;
+    int32 ManufacturerCount = 0;
+    int32 ExtractorCount = 0;
+    int32 GeneratorCount = 0;
+    int32 VehicleCount = 0;
+    int32 TrainCount = 0;
+    int32 PlayerCount = 0;
+    float TotalProducingEfficiency = 0.0f;
+    int32 ProducingMachinesCount = 0;
+
+    // Count manufacturers and aggregate production stats
+    for (TActorIterator<AFGBuildableManufacturer> ActorItr(World); ActorItr; ++ActorItr)
+    {
+        AFGBuildableManufacturer* Manufacturer = *ActorItr;
+        if (Manufacturer && Manufacturer->IsValidLowLevel())
+        {
+            ManufacturerCount++;
+            TotalPowerConsumption += Manufacturer->GetPowerConsumption();
+
+            float Efficiency = Manufacturer->GetProductionEfficiency();
+            if (Efficiency > 0.0f)
+            {
+                TotalProducingEfficiency += Efficiency;
+                ProducingMachinesCount++;
+            }
+        }
+    }
+
+    // Count extractors
+    for (TActorIterator<AFGBuildableResourceExtractor> ActorItr(World); ActorItr; ++ActorItr)
+    {
+        AFGBuildableResourceExtractor* Extractor = *ActorItr;
+        if (Extractor && Extractor->IsValidLowLevel())
+        {
+            ExtractorCount++;
+            TotalPowerConsumption += Extractor->GetPowerConsumption();
+
+            float Efficiency = Extractor->GetProductionEfficiency();
+            if (Efficiency > 0.0f)
+            {
+                TotalProducingEfficiency += Efficiency;
+                ProducingMachinesCount++;
+            }
+        }
+    }
+
+    // Count generators and power production
+    for (TActorIterator<AFGBuildablePowerGenerator> ActorItr(World); ActorItr; ++ActorItr)
+    {
+        AFGBuildablePowerGenerator* Generator = *ActorItr;
+        if (Generator && Generator->IsValidLowLevel())
+        {
+            GeneratorCount++;
+            TotalPowerProduction += Generator->GetPowerProduction();
+        }
+    }
+
+    // Count vehicles
+    for (TActorIterator<AFGWheeledVehicle> ActorItr(World); ActorItr; ++ActorItr)
+    {
+        if (ActorItr->IsValidLowLevel())
+        {
+            VehicleCount++;
+        }
+    }
+
+    // Count trains
+    for (TActorIterator<AFGTrain> ActorItr(World); ActorItr; ++ActorItr)
+    {
+        if (ActorItr->IsValidLowLevel())
+        {
+            TrainCount++;
+        }
+    }
+
+    // Count players
+    for (TActorIterator<AFGCharacterPlayer> ActorItr(World); ActorItr; ++ActorItr)
+    {
+        if (ActorItr->IsValidLowLevel())
+        {
+            PlayerCount++;
+        }
+    }
+
+    // Calculate average efficiency
+    float AvgEfficiency = ProducingMachinesCount > 0 ? TotalProducingEfficiency / ProducingMachinesCount : 0.0f;
+
+    // Set metrics using Splunk metrics naming convention
+    Fields->SetNumberField(TEXT("metric_name:factory.power.consumption"), TotalPowerConsumption);
+    Fields->SetNumberField(TEXT("metric_name:factory.power.production"), TotalPowerProduction);
+    Fields->SetNumberField(TEXT("metric_name:factory.power.net"), TotalPowerProduction - TotalPowerConsumption);
+    Fields->SetNumberField(TEXT("metric_name:factory.machines.manufacturers"), ManufacturerCount);
+    Fields->SetNumberField(TEXT("metric_name:factory.machines.extractors"), ExtractorCount);
+    Fields->SetNumberField(TEXT("metric_name:factory.machines.generators"), GeneratorCount);
+    Fields->SetNumberField(TEXT("metric_name:factory.efficiency.average"), AvgEfficiency);
+    Fields->SetNumberField(TEXT("metric_name:factory.vehicles.wheeled"), VehicleCount);
+    Fields->SetNumberField(TEXT("metric_name:factory.vehicles.trains"), TrainCount);
+    Fields->SetNumberField(TEXT("metric_name:factory.players"), PlayerCount);
+
+    MetricsEvent->SetObjectField(TEXT("fields"), Fields);
+    AddEventToBuffer(MetricsEvent);
+
+    // Update buffer count
+    EventsInBuffer = DataBuffer.Num();
+}
+
+void ASplunkExporter::CheckAndFlushBuffer()
+{
+    // Always flush on timer regardless of buffer size
+    if (DataBuffer.Num() > 0)
+    {
+        SendBufferedData();
+    }
 }
 
 void ASplunkExporter::SendDataToSplunk(const FString& JsonData)
@@ -848,9 +1026,9 @@ void ASplunkExporter::OnHttpResponse(FHttpRequestPtr Request, FHttpResponsePtr R
         int32 ResponseCode = Response->GetResponseCode();
         if (ResponseCode == 200)
         {
-            EventsSentTotal += BatchSize;
             LastSuccessfulSend = FDateTime::Now();
-            UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data successfully sent to Splunk"));
+            LastBufferFlush = FDateTime::Now();
+            UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data successfully sent to Splunk (HTTP 200)"));
         }
         else
         {
