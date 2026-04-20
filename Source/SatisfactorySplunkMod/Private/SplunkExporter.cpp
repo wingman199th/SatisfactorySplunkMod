@@ -24,46 +24,38 @@ void ASplunkExporter::LoadSettingsFromConfig()
         return;
     }
 
-    SplunkURL                  = Settings->SplunkURL;
-    HECToken                   = Settings->HECToken;
-    bUseMetricsMode            = Settings->bUseMetricsMode;
-    MetricsInterval            = Settings->MetricsInterval;
-    BufferFlushInterval        = Settings->BufferFlushInterval;
-    PowerCollectionInterval    = Settings->PowerCollectionInterval;
-    ProductionCollectionInterval = Settings->ProductionCollectionInterval;
-    VehicleCollectionInterval  = Settings->VehicleCollectionInterval;
-    PlayerCollectionInterval   = Settings->PlayerCollectionInterval;
-    LegacyBufferFlushInterval  = Settings->LegacyBufferFlushInterval;
-    BatchSize                  = Settings->BatchSize;
-    bCollectProductionData     = Settings->bCollectProductionData;
-    bCollectVehicleData        = Settings->bCollectVehicleData;
-    bCollectPlayerData         = Settings->bCollectPlayerData;
-    bCollectPowerData          = Settings->bCollectPowerData;
-    bCollectLayoutData         = Settings->bCollectLayoutData;
+    SplunkURL             = Settings->SplunkURL;
+    HECToken              = Settings->HECToken;
+    bUseMetricsMode       = Settings->bUseMetricsMode;
+    PowerInterval         = Settings->PowerInterval;
+    ProductionInterval    = Settings->ProductionInterval;
+    VehicleInterval       = Settings->VehicleInterval;
+    PlayerInterval        = Settings->PlayerInterval;
+    BufferFlushInterval   = Settings->BufferFlushInterval;
+    BatchSize             = Settings->BatchSize;
+    bCollectPowerData     = Settings->bCollectPowerData;
+    bCollectProductionData = Settings->bCollectProductionData;
+    bCollectVehicleData   = Settings->bCollectVehicleData;
+    bCollectPlayerData    = Settings->bCollectPlayerData;
+    bCollectLayoutData    = Settings->bCollectLayoutData;
 
-    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Config loaded - URL: %s | Mode: %s"),
-        *SplunkURL, bUseMetricsMode ? TEXT("Metrics") : TEXT("Events"));
-    if (!bUseMetricsMode)
-    {
-        UE_LOG(LogSatisfactorySplunkMod, Log,
-            TEXT("SplunkExporter: Legacy intervals - Power: %.1fs  Production: %.1fs  Vehicles: %.1fs  Players: %.1fs"),
-            PowerCollectionInterval, ProductionCollectionInterval, VehicleCollectionInterval, PlayerCollectionInterval);
-    }
+    UE_LOG(LogSatisfactorySplunkMod, Log,
+        TEXT("SplunkExporter: Config loaded - Mode: %s | Power: %.1fs  Production: %.1fs  Vehicles: %.1fs  Players: %.1fs  Flush: %.1fs"),
+        bUseMetricsMode ? TEXT("Metrics") : TEXT("Events"),
+        PowerInterval, ProductionInterval, VehicleInterval, PlayerInterval, BufferFlushInterval);
 
     if (!Settings->IsConfigured())
     {
         UE_LOG(LogSatisfactorySplunkMod, Warning,
-            TEXT("SplunkExporter: HEC token and/or Splunk URL are still set to placeholder values. ")
-            TEXT("Edit Config/DefaultSatisfactorySplunkMod.ini with your Splunk details and restart."));
+            TEXT("SplunkExporter: HEC token and/or Splunk URL are still placeholders. ")
+            TEXT("Edit Config/DefaultSatisfactorySplunkMod.ini and restart."));
     }
 }
 
 void ASplunkExporter::BeginPlay()
 {
     Super::BeginPlay();
-
     UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Starting up"));
-
     LoadSettingsFromConfig();
     StartDataCollection();
 }
@@ -71,111 +63,88 @@ void ASplunkExporter::BeginPlay()
 void ASplunkExporter::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     StopDataCollection();
-    
-    // Send any remaining buffered data
     if (DataBuffer.Num() > 0)
     {
         SendBufferedData();
     }
-    
     Super::EndPlay(EndPlayReason);
 }
 
 void ASplunkExporter::StartDataCollection()
 {
-    // Guard against unconfigured placeholders
     if (HECToken.IsEmpty() || HECToken == TEXT("your-hec-token-here"))
     {
         UE_LOG(LogSatisfactorySplunkMod, Error,
-            TEXT("SplunkExporter: HEC Token is not set. ")
-            TEXT("Open Config/DefaultSatisfactorySplunkMod.ini, set HECToken, and restart."));
+            TEXT("SplunkExporter: HEC Token is not set. Edit Config/DefaultSatisfactorySplunkMod.ini and restart."));
         return;
     }
     if (SplunkURL.IsEmpty() || SplunkURL == TEXT("https://your-splunk-instance:8088/services/collector"))
     {
         UE_LOG(LogSatisfactorySplunkMod, Error,
-            TEXT("SplunkExporter: Splunk URL is not set. ")
-            TEXT("Open Config/DefaultSatisfactorySplunkMod.ini, set SplunkURL, and restart."));
+            TEXT("SplunkExporter: Splunk URL is not set. Edit Config/DefaultSatisfactorySplunkMod.ini and restart."));
         return;
     }
 
     UWorld* World = GetWorld();
-    if (World && !bIsCollecting)
+    if (!World || bIsCollecting) return;
+
+    FTimerManager& TM = World->GetTimerManager();
+
+    // Each data type gets its own independent timer.
+    // In metrics mode the timer calls an aggregated collector.
+    // In events mode the timer calls a detailed per-machine collector.
+    // The same interval settings apply to both modes.
+
+    if (bCollectPowerData)
     {
-        FTimerManager& TimerManager = World->GetTimerManager();
-
-        if (bUseMetricsMode)
-        {
-            // Fast metrics collection every 1 second (or configured interval)
-            TimerManager.SetTimer(
-                MetricsCollectionTimer,
-                this,
-                &ASplunkExporter::CollectMetrics,
-                MetricsInterval,
-                true
-            );
-
-            // Time-based buffer flush every 30 seconds (or configured interval)
-            TimerManager.SetTimer(
-                BufferFlushTimer,
-                this,
-                &ASplunkExporter::CheckAndFlushBuffer,
-                BufferFlushInterval,
-                true
-            );
-
-            UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Metrics mode started (collect: %.1fs, flush: %.1fs)"),
-                MetricsInterval, BufferFlushInterval);
-        }
-        else
-        {
-            // Legacy mode: each data type on its own independent timer
-            if (bCollectPowerData)
-            {
-                TimerManager.SetTimer(PowerCollectionTimer, this, &ASplunkExporter::CollectPowerData, PowerCollectionInterval, true);
-            }
-            if (bCollectProductionData)
-            {
-                TimerManager.SetTimer(ProductionCollectionTimer, this, &ASplunkExporter::CollectProductionData, ProductionCollectionInterval, true);
-            }
-            if (bCollectVehicleData)
-            {
-                TimerManager.SetTimer(VehicleCollectionTimer, this, &ASplunkExporter::CollectAllVehicleData, VehicleCollectionInterval, true);
-            }
-            if (bCollectPlayerData)
-            {
-                TimerManager.SetTimer(PlayerCollectionTimer, this, &ASplunkExporter::CollectPlayerMovementSystems, PlayerCollectionInterval, true);
-            }
-
-            // Shared buffer flush timer for legacy mode
-            TimerManager.SetTimer(LegacyBufferFlushTimer, this, &ASplunkExporter::CheckAndFlushBuffer, LegacyBufferFlushInterval, true);
-
-            UE_LOG(LogSatisfactorySplunkMod, Log,
-                TEXT("SplunkExporter: Events mode started - Power: %.1fs  Production: %.1fs  Vehicles: %.1fs  Players: %.1fs  Flush: %.1fs"),
-                PowerCollectionInterval, ProductionCollectionInterval, VehicleCollectionInterval, PlayerCollectionInterval, LegacyBufferFlushInterval);
-        }
-
-        bIsCollecting = true;
-        LastBufferFlush = FDateTime::Now();
+        TM.SetTimer(PowerTimer, this,
+            bUseMetricsMode ? &ASplunkExporter::CollectPowerMetrics : &ASplunkExporter::CollectPowerData,
+            PowerInterval, true);
     }
+    if (bCollectProductionData)
+    {
+        TM.SetTimer(ProductionTimer, this,
+            bUseMetricsMode ? &ASplunkExporter::CollectProductionMetrics : &ASplunkExporter::CollectProductionData,
+            ProductionInterval, true);
+    }
+    if (bCollectVehicleData)
+    {
+        TM.SetTimer(VehicleTimer, this,
+            bUseMetricsMode ? &ASplunkExporter::CollectVehicleMetrics : &ASplunkExporter::CollectAllVehicleData,
+            VehicleInterval, true);
+    }
+    if (bCollectPlayerData)
+    {
+        TM.SetTimer(PlayerTimer, this,
+            bUseMetricsMode ? &ASplunkExporter::CollectPlayerMetrics : &ASplunkExporter::CollectPlayerMovementSystems,
+            PlayerInterval, true);
+    }
+
+    TM.SetTimer(BufferFlushTimer, this, &ASplunkExporter::CheckAndFlushBuffer, BufferFlushInterval, true);
+
+    bIsCollecting = true;
+    LastBufferFlush = FDateTime::Now();
+
+    UE_LOG(LogSatisfactorySplunkMod, Log,
+        TEXT("SplunkExporter: Collection started (%s mode) - Power: %.1fs  Production: %.1fs  Vehicles: %.1fs  Players: %.1fs"),
+        bUseMetricsMode ? TEXT("Metrics") : TEXT("Events"),
+        PowerInterval, ProductionInterval, VehicleInterval, PlayerInterval);
 }
 
 void ASplunkExporter::StopDataCollection()
 {
     UWorld* World = GetWorld();
-    if (World && bIsCollecting)
-    {
-        FTimerManager& TimerManager = World->GetTimerManager();
-        TimerManager.ClearTimer(MetricsCollectionTimer);
-        TimerManager.ClearTimer(BufferFlushTimer);
-        TimerManager.ClearTimer(PowerCollectionTimer);
-        TimerManager.ClearTimer(ProductionCollectionTimer);
-        TimerManager.ClearTimer(VehicleCollectionTimer);
-        TimerManager.ClearTimer(PlayerCollectionTimer);
-        TimerManager.ClearTimer(LegacyBufferFlushTimer);
-        bIsCollecting = false;
-        UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data collection stopped"));
-    }
+    if (!World || !bIsCollecting) return;
+
+    FTimerManager& TM = World->GetTimerManager();
+    TM.ClearTimer(PowerTimer);
+    TM.ClearTimer(ProductionTimer);
+    TM.ClearTimer(VehicleTimer);
+    TM.ClearTimer(PlayerTimer);
+    TM.ClearTimer(BufferFlushTimer);
+
+    bIsCollecting = false;
+    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data collection stopped"));
 }
 
 void ASplunkExporter::CollectAndSendData()
@@ -916,138 +885,114 @@ void ASplunkExporter::CollectFactoryLayoutData()
     SendLayoutDataToSplunk(LayoutEvent);
 }
 
-// ===== METRICS MODE METHODS =====
+// ===== METRICS MODE - PER-TYPE COLLECTORS =====
 
-void ASplunkExporter::CollectMetrics()
+TSharedPtr<FJsonObject> ASplunkExporter::CreateMetricsEvent()
 {
-    if (!GetWorld())
-    {
-        return;
-    }
-
-    CollectAggregateMetrics();
+    TSharedPtr<FJsonObject> Event = MakeShareable(new FJsonObject);
+    Event->SetStringField(TEXT("time"), FString::Printf(TEXT("%.0f"), FDateTime::Now().ToUnixTimestamp()));
+    Event->SetStringField(TEXT("event"), TEXT("metric"));
+    Event->SetStringField(TEXT("source"), TEXT("satisfactory-mod"));
+    Event->SetStringField(TEXT("sourcetype"), TEXT("satisfactory:metrics"));
+    return Event;
 }
 
-void ASplunkExporter::CollectAggregateMetrics()
+void ASplunkExporter::CollectPowerMetrics()
 {
     UWorld* World = GetWorld();
     if (!World) return;
 
-    // Create metrics event using Splunk metrics format
-    TSharedPtr<FJsonObject> MetricsEvent = MakeShareable(new FJsonObject);
+    float TotalConsumption = 0.0f;
+    float TotalProduction = 0.0f;
+    int32 GeneratorCount = 0;
+
+    for (TActorIterator<AFGBuildablePowerGenerator> It(World); It; ++It)
+        if (It->IsValidLowLevel()) { GeneratorCount++; TotalProduction += It->GetPowerProduction(); }
+
+    for (TActorIterator<AFGBuildableManufacturer> It(World); It; ++It)
+        if (It->IsValidLowLevel()) TotalConsumption += It->GetPowerConsumption();
+
+    for (TActorIterator<AFGBuildableResourceExtractor> It(World); It; ++It)
+        if (It->IsValidLowLevel()) TotalConsumption += It->GetPowerConsumption();
+
+    TSharedPtr<FJsonObject> Event = CreateMetricsEvent();
     TSharedPtr<FJsonObject> Fields = MakeShareable(new FJsonObject);
+    Fields->SetNumberField(TEXT("metric_name:factory.power.consumption"), TotalConsumption);
+    Fields->SetNumberField(TEXT("metric_name:factory.power.production"), TotalProduction);
+    Fields->SetNumberField(TEXT("metric_name:factory.power.net"),        TotalProduction - TotalConsumption);
+    Fields->SetNumberField(TEXT("metric_name:factory.machines.generators"), GeneratorCount);
+    Event->SetObjectField(TEXT("fields"), Fields);
+    AddEventToBuffer(Event);
+    EventsInBuffer = DataBuffer.Num();
+}
 
-    double Timestamp = FDateTime::Now().ToUnixTimestamp();
-    MetricsEvent->SetStringField(TEXT("time"), FString::Printf(TEXT("%.0f"), Timestamp));
-    MetricsEvent->SetStringField(TEXT("event"), TEXT("metric"));
-    MetricsEvent->SetStringField(TEXT("source"), TEXT("satisfactory-mod"));
-    MetricsEvent->SetStringField(TEXT("sourcetype"), TEXT("satisfactory:metrics"));
+void ASplunkExporter::CollectProductionMetrics()
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
 
-    // Aggregate metrics
-    float TotalPowerConsumption = 0.0f;
-    float TotalPowerProduction = 0.0f;
     int32 ManufacturerCount = 0;
     int32 ExtractorCount = 0;
-    int32 GeneratorCount = 0;
-    int32 VehicleCount = 0;
-    int32 TrainCount = 0;
-    int32 PlayerCount = 0;
-    float TotalProducingEfficiency = 0.0f;
-    int32 ProducingMachinesCount = 0;
+    float TotalEfficiency = 0.0f;
+    int32 ProducingCount = 0;
 
-    // Count manufacturers and aggregate production stats
-    for (TActorIterator<AFGBuildableManufacturer> ActorItr(World); ActorItr; ++ActorItr)
+    for (TActorIterator<AFGBuildableManufacturer> It(World); It; ++It)
     {
-        AFGBuildableManufacturer* Manufacturer = *ActorItr;
-        if (Manufacturer && Manufacturer->IsValidLowLevel())
-        {
-            ManufacturerCount++;
-            TotalPowerConsumption += Manufacturer->GetPowerConsumption();
-
-            float Efficiency = Manufacturer->GetProductionEfficiency();
-            if (Efficiency > 0.0f)
-            {
-                TotalProducingEfficiency += Efficiency;
-                ProducingMachinesCount++;
-            }
-        }
+        if (!It->IsValidLowLevel()) continue;
+        ManufacturerCount++;
+        float Eff = It->GetProductionEfficiency();
+        if (Eff > 0.0f) { TotalEfficiency += Eff; ProducingCount++; }
+    }
+    for (TActorIterator<AFGBuildableResourceExtractor> It(World); It; ++It)
+    {
+        if (!It->IsValidLowLevel()) continue;
+        ExtractorCount++;
+        float Eff = It->GetProductionEfficiency();
+        if (Eff > 0.0f) { TotalEfficiency += Eff; ProducingCount++; }
     }
 
-    // Count extractors
-    for (TActorIterator<AFGBuildableResourceExtractor> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        AFGBuildableResourceExtractor* Extractor = *ActorItr;
-        if (Extractor && Extractor->IsValidLowLevel())
-        {
-            ExtractorCount++;
-            TotalPowerConsumption += Extractor->GetPowerConsumption();
-
-            float Efficiency = Extractor->GetProductionEfficiency();
-            if (Efficiency > 0.0f)
-            {
-                TotalProducingEfficiency += Efficiency;
-                ProducingMachinesCount++;
-            }
-        }
-    }
-
-    // Count generators and power production
-    for (TActorIterator<AFGBuildablePowerGenerator> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        AFGBuildablePowerGenerator* Generator = *ActorItr;
-        if (Generator && Generator->IsValidLowLevel())
-        {
-            GeneratorCount++;
-            TotalPowerProduction += Generator->GetPowerProduction();
-        }
-    }
-
-    // Count vehicles
-    for (TActorIterator<AFGWheeledVehicle> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        if (ActorItr->IsValidLowLevel())
-        {
-            VehicleCount++;
-        }
-    }
-
-    // Count trains
-    for (TActorIterator<AFGTrain> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        if (ActorItr->IsValidLowLevel())
-        {
-            TrainCount++;
-        }
-    }
-
-    // Count players
-    for (TActorIterator<AFGCharacterPlayer> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        if (ActorItr->IsValidLowLevel())
-        {
-            PlayerCount++;
-        }
-    }
-
-    // Calculate average efficiency
-    float AvgEfficiency = ProducingMachinesCount > 0 ? TotalProducingEfficiency / ProducingMachinesCount : 0.0f;
-
-    // Set metrics using Splunk metrics naming convention
-    Fields->SetNumberField(TEXT("metric_name:factory.power.consumption"), TotalPowerConsumption);
-    Fields->SetNumberField(TEXT("metric_name:factory.power.production"), TotalPowerProduction);
-    Fields->SetNumberField(TEXT("metric_name:factory.power.net"), TotalPowerProduction - TotalPowerConsumption);
+    TSharedPtr<FJsonObject> Event = CreateMetricsEvent();
+    TSharedPtr<FJsonObject> Fields = MakeShareable(new FJsonObject);
     Fields->SetNumberField(TEXT("metric_name:factory.machines.manufacturers"), ManufacturerCount);
-    Fields->SetNumberField(TEXT("metric_name:factory.machines.extractors"), ExtractorCount);
-    Fields->SetNumberField(TEXT("metric_name:factory.machines.generators"), GeneratorCount);
-    Fields->SetNumberField(TEXT("metric_name:factory.efficiency.average"), AvgEfficiency);
-    Fields->SetNumberField(TEXT("metric_name:factory.vehicles.wheeled"), VehicleCount);
-    Fields->SetNumberField(TEXT("metric_name:factory.vehicles.trains"), TrainCount);
+    Fields->SetNumberField(TEXT("metric_name:factory.machines.extractors"),   ExtractorCount);
+    Fields->SetNumberField(TEXT("metric_name:factory.efficiency.average"),    ProducingCount > 0 ? TotalEfficiency / ProducingCount : 0.0f);
+    Event->SetObjectField(TEXT("fields"), Fields);
+    AddEventToBuffer(Event);
+    EventsInBuffer = DataBuffer.Num();
+}
+
+void ASplunkExporter::CollectVehicleMetrics()
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    int32 WheeledCount = 0;
+    int32 TrainCount = 0;
+    for (TActorIterator<AFGWheeledVehicle> It(World); It; ++It) if (It->IsValidLowLevel()) WheeledCount++;
+    for (TActorIterator<AFGTrain>          It(World); It; ++It) if (It->IsValidLowLevel()) TrainCount++;
+
+    TSharedPtr<FJsonObject> Event = CreateMetricsEvent();
+    TSharedPtr<FJsonObject> Fields = MakeShareable(new FJsonObject);
+    Fields->SetNumberField(TEXT("metric_name:factory.vehicles.wheeled"), WheeledCount);
+    Fields->SetNumberField(TEXT("metric_name:factory.vehicles.trains"),  TrainCount);
+    Event->SetObjectField(TEXT("fields"), Fields);
+    AddEventToBuffer(Event);
+    EventsInBuffer = DataBuffer.Num();
+}
+
+void ASplunkExporter::CollectPlayerMetrics()
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    int32 PlayerCount = 0;
+    for (TActorIterator<AFGCharacterPlayer> It(World); It; ++It) if (It->IsValidLowLevel()) PlayerCount++;
+
+    TSharedPtr<FJsonObject> Event = CreateMetricsEvent();
+    TSharedPtr<FJsonObject> Fields = MakeShareable(new FJsonObject);
     Fields->SetNumberField(TEXT("metric_name:factory.players"), PlayerCount);
-
-    MetricsEvent->SetObjectField(TEXT("fields"), Fields);
-    AddEventToBuffer(MetricsEvent);
-
-    // Update buffer count
+    Event->SetObjectField(TEXT("fields"), Fields);
+    AddEventToBuffer(Event);
     EventsInBuffer = DataBuffer.Num();
 }
 
