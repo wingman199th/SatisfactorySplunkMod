@@ -15,13 +15,46 @@ ASplunkExporter::ASplunkExporter()
     LastBufferFlush = FDateTime::Now();
 }
 
+void ASplunkExporter::LoadSettingsFromConfig()
+{
+    USplunkModSettings* Settings = USplunkModSettings::Get();
+    if (!Settings)
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Warning, TEXT("SplunkExporter: Could not load mod settings"));
+        return;
+    }
+
+    SplunkURL             = Settings->SplunkURL;
+    HECToken              = Settings->HECToken;
+    bUseMetricsMode       = Settings->bUseMetricsMode;
+    MetricsInterval       = Settings->MetricsInterval;
+    BufferFlushInterval   = Settings->BufferFlushInterval;
+    CollectionInterval    = Settings->CollectionInterval;
+    BatchSize             = Settings->BatchSize;
+    bCollectProductionData = Settings->bCollectProductionData;
+    bCollectVehicleData   = Settings->bCollectVehicleData;
+    bCollectPlayerData    = Settings->bCollectPlayerData;
+    bCollectPowerData     = Settings->bCollectPowerData;
+    bCollectLayoutData    = Settings->bCollectLayoutData;
+
+    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Config loaded - URL: %s | Mode: %s"),
+        *SplunkURL, bUseMetricsMode ? TEXT("Metrics") : TEXT("Events"));
+
+    if (!Settings->IsConfigured())
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Warning,
+            TEXT("SplunkExporter: HEC token and/or Splunk URL are still set to placeholder values. ")
+            TEXT("Edit Config/DefaultSatisfactorySplunkMod.ini with your Splunk details and restart."));
+    }
+}
+
 void ASplunkExporter::BeginPlay()
 {
     Super::BeginPlay();
 
     UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Starting up"));
 
-    // Auto-start data collection
+    LoadSettingsFromConfig();
     StartDataCollection();
 }
 
@@ -40,6 +73,22 @@ void ASplunkExporter::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void ASplunkExporter::StartDataCollection()
 {
+    // Guard against unconfigured placeholders
+    if (HECToken.IsEmpty() || HECToken == TEXT("your-hec-token-here"))
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Error,
+            TEXT("SplunkExporter: HEC Token is not set. ")
+            TEXT("Open Config/DefaultSatisfactorySplunkMod.ini, set HECToken, and restart."));
+        return;
+    }
+    if (SplunkURL.IsEmpty() || SplunkURL == TEXT("https://your-splunk-instance:8088/services/collector"))
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Error,
+            TEXT("SplunkExporter: Splunk URL is not set. ")
+            TEXT("Open Config/DefaultSatisfactorySplunkMod.ini, set SplunkURL, and restart."));
+        return;
+    }
+
     UWorld* World = GetWorld();
     if (World && !bIsCollecting)
     {
@@ -1021,22 +1070,37 @@ void ASplunkExporter::SendLayoutDataToSplunk(TSharedPtr<FJsonObject> LayoutData)
 
 void ASplunkExporter::OnHttpResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful)
 {
-    if (bWasSuccessful && Response.IsValid())
+    if (!bWasSuccessful || !Response.IsValid())
     {
-        int32 ResponseCode = Response->GetResponseCode();
-        if (ResponseCode == 200)
-        {
-            LastSuccessfulSend = FDateTime::Now();
-            LastBufferFlush = FDateTime::Now();
-            UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data successfully sent to Splunk (HTTP 200)"));
-        }
-        else
-        {
-            UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkExporter: HTTP Error %d - %s"), ResponseCode, *Response->GetContentAsString());
-        }
+        UE_LOG(LogSatisfactorySplunkMod, Error,
+            TEXT("SplunkExporter: Network error - could not reach Splunk at %s"), *SplunkURL);
+        return;
     }
-    else
+
+    int32 ResponseCode = Response->GetResponseCode();
+
+    if (ResponseCode >= 200 && ResponseCode < 300)
     {
-        UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkExporter: Failed to send data to Splunk"));
+        LastSuccessfulSend = FDateTime::Now();
+        LastBufferFlush    = FDateTime::Now();
+        EventsSentTotal++;
+        UE_LOG(LogSatisfactorySplunkMod, Log,
+            TEXT("SplunkExporter: Data sent successfully (HTTP %d). Total sends: %d"),
+            ResponseCode, EventsSentTotal);
+        return;
     }
+
+    // Specific HEC error messages to help with troubleshooting
+    FString Reason;
+    switch (ResponseCode)
+    {
+        case 400: Reason = TEXT("Bad request - check JSON payload format");            break;
+        case 401: Reason = TEXT("Unauthorized - HECToken is invalid or missing");     break;
+        case 403: Reason = TEXT("Forbidden - HEC input may be disabled in Splunk");   break;
+        case 404: Reason = TEXT("Not found - check SplunkURL path (/services/collector)"); break;
+        case 503: Reason = TEXT("Splunk is busy or unavailable - will retry on next cycle"); break;
+        default:  Reason = Response->GetContentAsString();                              break;
+    }
+    UE_LOG(LogSatisfactorySplunkMod, Error,
+        TEXT("SplunkExporter: HTTP %d - %s"), ResponseCode, *Reason);
 }

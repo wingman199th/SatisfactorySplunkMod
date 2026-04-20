@@ -35,6 +35,7 @@
 #include "FGRecipe.h"
 #include "GameFramework/CharacterMovementComponent.h"
 
+#include "SplunkModSettings.h"
 #include "SplunkExporter.generated.h"
 
 UCLASS(BlueprintType, Blueprintable)
@@ -65,6 +66,10 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
     void CollectMetrics();
+
+    // Load connection and collection settings from DefaultSatisfactorySplunkMod.ini
+    UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
+    void LoadSettingsFromConfig();
 
 private:
     // Metrics collection (fast, aggregated)
