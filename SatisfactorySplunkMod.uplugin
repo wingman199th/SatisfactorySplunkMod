@@ -2,8 +2,9 @@
     "FileVersion": 3,
     "Version": 1,
     "VersionName": "1.0.0",
+    "SemVersion": "1.0.0",
     "FriendlyName": "Satisfactory Splunk Exporter",
-    "Description": "Exports production, vehicle, and player data to Splunk for analytics. Configure Splunk URL and HEC token in Blueprint before use.",
+    "Description": "Exports production, vehicle, and player data to Splunk for analytics. Edit Config/DefaultSatisfactorySplunkMod.ini to set your Splunk URL and HEC token.",
     "Category": "Modding",
     "CreatedBy": "Community",
     "CreatedByURL": "",
@@ -14,6 +15,7 @@
     "IsBetaVersion": false,
     "IsExperimentalVersion": false,
     "Installed": false,
+    "GameVersion": ">=365306",
     "Modules": [
         {
             "Name": "SatisfactorySplunkMod",
@@ -24,6 +26,7 @@
     "Plugins": [
         {
             "Name": "SML",
+            "SemVersion": "^3.6.0",
             "Enabled": true
         }
     ]

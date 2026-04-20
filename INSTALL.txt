@@ -4,16 +4,16 @@
 
 REQUIREMENTS
 ------------
-- Satisfactory (Steam or Epic Games version)
-- Satisfactory Mod Loader (SML) installed
+- Satisfactory (Steam or Epic Games version, Update 8 or later)
+- Satisfactory Mod Loader (SML) version 3.6.0 or later
 - A Splunk instance with HTTP Event Collector (HEC) enabled
-- Splunk HEC token (see Step 3 below)
+- A Splunk HEC token (see Step 3 below)
 
 
 ------------------------------------------------------------
 STEP 1 - Install Satisfactory Mod Loader (SML)
 ------------------------------------------------------------
-If you already have SML installed, skip to Step 2.
+If you already have SML 3.6.0+ installed, skip to Step 2.
 
 1. Download the Satisfactory Mod Manager from:
    https://smm.ficsit.app
@@ -51,6 +51,9 @@ STEP 2 - Install the Mod
        ├── Source\
        └── ...
 
+   NOTE: The mod folder must be placed inside the Mods\
+   directory, NOT the Plugins\ directory.
+
 
 ------------------------------------------------------------
 STEP 3 - Generate a Splunk HEC Token
@@ -74,7 +77,7 @@ If you already have an HEC token, skip to Step 4.
 
 7. Copy the token value shown - you will need it in Step 4.
 
-8. Make sure HEC is enabled:
+8. Make sure HEC is enabled globally:
    Settings > Data Inputs > HTTP Event Collector > Global Settings
    Ensure "All Tokens" is set to Enabled.
 
@@ -96,63 +99,53 @@ STEP 4 - Configure the Mod
 4. Save the file.
 
    Optional settings you may want to review:
-   - bUseMetricsMode : True = fast summary data (recommended)
-                       False = detailed per-machine events
-   - MetricsInterval : how often data is collected (seconds)
+   - bUseMetricsMode     : True = fast summary data (recommended)
+                           False = detailed per-machine events
+   - MetricsInterval     : how often data is collected (seconds)
    - BufferFlushInterval : how often data is sent to Splunk (seconds)
 
 
 ------------------------------------------------------------
-STEP 5 - Place the Actor in Your World
+STEP 5 - Launch and Verify
 ------------------------------------------------------------
-The mod works through a Blueprint Actor that you place in your
-save game once.
+The mod uses SML's module system to start automatically when
+you load a save. You do NOT need to place any actor in your
+world - the mod handles everything on its own.
 
-1. Launch Satisfactory and load your save.
+1. Launch Satisfactory and load your save (or start a new one).
 
-2. Open the Blueprint editor or use the in-game build menu to
-   find "SplunkExporter".
+2. The mod will start collecting and sending data immediately.
 
-3. Place one SplunkExporter actor anywhere in your world
-   (location does not matter).
-
-4. The actor will automatically start sending data to Splunk
-   when the level loads.
-
-   Note: You only need to place it once - it will persist in
-   your save file.
-
-
-------------------------------------------------------------
-STEP 6 - Verify Data is Arriving in Splunk
-------------------------------------------------------------
-1. In Splunk, open Search & Reporting.
-
-2. Run this search:
+3. In Splunk, open Search & Reporting and run:
    index=satisfactory sourcetype=satisfactory:metrics
 
-3. You should see events appearing within a few seconds of
-   loading your Satisfactory save.
+   You should see events appearing within a few seconds.
 
-   If no events appear, check the Satisfactory log file for
-   errors from SplunkExporter:
+4. If no events appear, check the Satisfactory log file:
    %APPDATA%\Local\FactoryGame\Saved\Logs\FactoryGame.log
 
-   Common log messages to look for:
-   - "Config loaded" = mod started and read your ini file
-   - "HEC Token is not set" = check Step 4
-   - "HTTP 401" = your HEC token is wrong
-   - "HTTP 403" = HEC is disabled in Splunk (check Step 3 #8)
-   - "Network error" = Splunk URL is unreachable
+   Look for lines containing "SplunkExporter" or
+   "SplunkGameWorldModule" to diagnose the issue.
+
+   Common log messages:
+   - "SplunkExporter spawned successfully" = mod is running
+   - "Config loaded"                        = ini file was read
+   - "HEC Token is not set"                 = check Step 4
+   - "HTTP 401"                             = HEC token is wrong
+   - "HTTP 403"                             = HEC disabled in Splunk
+   - "Network error"                        = Splunk URL unreachable
 
 
 ------------------------------------------------------------
 TROUBLESHOOTING
 ------------------------------------------------------------
-Problem : No data in Splunk, no errors in log
-Solution: Make sure you placed the SplunkExporter actor in
-          the world (Step 5) and that the save was reloaded
-          after editing the ini file.
+Problem : No data in Splunk and no SplunkExporter log entries
+Solution: Confirm the mod folder is inside Mods\ (not Plugins\)
+          and that SML version is 3.6.0 or later.
+
+Problem : "HEC Token is not set" in log
+Solution: Edit Config/DefaultSatisfactorySplunkMod.ini and
+          set HECToken to your actual token, then restart.
 
 Problem : HTTP 401 Unauthorized
 Solution: Your HECToken is incorrect. Re-copy it from Splunk
@@ -164,14 +157,19 @@ Solution: HEC is disabled globally in Splunk. Go to
           Global Settings and enable it.
 
 Problem : Network error / cannot reach Splunk
-Solution: Check that your SplunkURL is correct and that port
-          8088 is open on your Splunk server firewall.
-          Test by opening the URL in a browser - you should
-          get a JSON response from Splunk.
+Solution: Check that SplunkURL is correct and that port 8088
+          is open on your Splunk server firewall. Test by
+          pasting the URL into a browser - you should get a
+          JSON response from Splunk HEC.
+
+Problem : Game refuses to launch / "mod version mismatch"
+Solution: Update Satisfactory to Update 8 or later, and
+          update SML to version 3.6.0 or later via the
+          Satisfactory Mod Manager.
 
 Problem : Game crashes on startup after installing
 Solution: Verify SML is installed and up to date. The mod
-          requires SML to load correctly.
+          requires SML 3.6.0+ to load correctly.
 
 
 ------------------------------------------------------------
@@ -179,9 +177,8 @@ UNINSTALLING
 ------------------------------------------------------------
 1. Remove the SatisfactorySplunkMod folder from the Mods
    directory.
-2. If you placed a SplunkExporter actor in your save, load
-   the save and delete the actor before uninstalling to keep
-   your save file clean.
+2. Because the mod auto-spawns its actor (not saved to your
+   save file), no save file cleanup is required.
 
 
 ------------------------------------------------------------

@@ -25,7 +25,8 @@ public class SatisfactorySplunkMod : ModuleRules
                 "Http",
                 "Json",
                 "JsonUtilities",
-                "FactoryGame"
+                "FactoryGame",
+                "SML"
             }
         );
 
