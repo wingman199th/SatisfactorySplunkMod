@@ -199,24 +199,20 @@ void ASplunkExporter::SendBufferedData()
     {
         return;
     }
-    
-    TSharedPtr<FJsonObject> BatchObject = MakeShareable(new FJsonObject);
-    TArray<TSharedPtr<FJsonValue>> EventsArray;
-    
+
+    // Splunk HEC batch format: one JSON object per line (NOT wrapped in an array)
+    FString BatchString;
     for (auto& Event : DataBuffer)
     {
-        EventsArray.Add(MakeShareable(new FJsonValueObject(Event)));
+        FString EventString;
+        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&EventString);
+        FJsonSerializer::Serialize(Event.ToSharedRef(), Writer);
+        BatchString += EventString + TEXT("\n");
     }
-    
-    BatchObject->SetArrayField(TEXT("events"), EventsArray);
-    
-    FString OutputString;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
-    FJsonSerializer::Serialize(BatchObject.ToSharedRef(), Writer);
-    
+
     UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Sending batch of %d events to Splunk"), DataBuffer.Num());
-    
-    SendDataToSplunk(OutputString);
+
+    SendDataToSplunk(BatchString);
     DataBuffer.Empty();
     EventsInBuffer = 0;
 }
