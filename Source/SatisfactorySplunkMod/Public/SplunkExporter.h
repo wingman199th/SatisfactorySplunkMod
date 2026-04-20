@@ -97,10 +97,16 @@ private:
     TSharedPtr<FJsonObject> CreateBaseEvent(const FString& SourceType);
 
 private:
-    // Timers
+    // Metrics mode timers
     FTimerHandle MetricsCollectionTimer;
     FTimerHandle BufferFlushTimer;
-    FTimerHandle DataCollectionTimer;  // Legacy timer for detailed events
+
+    // Legacy events mode: one independent timer per data type
+    FTimerHandle PowerCollectionTimer;
+    FTimerHandle ProductionCollectionTimer;
+    FTimerHandle VehicleCollectionTimer;
+    FTimerHandle PlayerCollectionTimer;
+    FTimerHandle LegacyBufferFlushTimer;
 
     // Data buffer for batching
     TArray<TSharedPtr<FJsonObject>> DataBuffer;
@@ -124,11 +130,24 @@ private:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Metrics Settings", meta = (AllowPrivateAccess = "true"))
     bool bUseMetricsMode = true;  // Use fast metrics mode instead of detailed events
 
+    // Legacy events mode: per-type collection intervals
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Settings", meta = (AllowPrivateAccess = "true"))
-    float CollectionInterval = 30.0f;  // Legacy: for detailed events mode
+    float PowerCollectionInterval = 2.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Settings", meta = (AllowPrivateAccess = "true"))
-    int32 BatchSize = 10;  // Legacy: not used in metrics mode
+    float ProductionCollectionInterval = 10.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Settings", meta = (AllowPrivateAccess = "true"))
+    float VehicleCollectionInterval = 5.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Settings", meta = (AllowPrivateAccess = "true"))
+    float PlayerCollectionInterval = 30.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Settings", meta = (AllowPrivateAccess = "true"))
+    float LegacyBufferFlushInterval = 5.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Settings", meta = (AllowPrivateAccess = "true"))
+    int32 BatchSize = 10;
     
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Settings", meta = (AllowPrivateAccess = "true"))
     bool bCollectProductionData = true;

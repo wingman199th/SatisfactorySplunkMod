@@ -24,21 +24,31 @@ void ASplunkExporter::LoadSettingsFromConfig()
         return;
     }
 
-    SplunkURL             = Settings->SplunkURL;
-    HECToken              = Settings->HECToken;
-    bUseMetricsMode       = Settings->bUseMetricsMode;
-    MetricsInterval       = Settings->MetricsInterval;
-    BufferFlushInterval   = Settings->BufferFlushInterval;
-    CollectionInterval    = Settings->CollectionInterval;
-    BatchSize             = Settings->BatchSize;
-    bCollectProductionData = Settings->bCollectProductionData;
-    bCollectVehicleData   = Settings->bCollectVehicleData;
-    bCollectPlayerData    = Settings->bCollectPlayerData;
-    bCollectPowerData     = Settings->bCollectPowerData;
-    bCollectLayoutData    = Settings->bCollectLayoutData;
+    SplunkURL                  = Settings->SplunkURL;
+    HECToken                   = Settings->HECToken;
+    bUseMetricsMode            = Settings->bUseMetricsMode;
+    MetricsInterval            = Settings->MetricsInterval;
+    BufferFlushInterval        = Settings->BufferFlushInterval;
+    PowerCollectionInterval    = Settings->PowerCollectionInterval;
+    ProductionCollectionInterval = Settings->ProductionCollectionInterval;
+    VehicleCollectionInterval  = Settings->VehicleCollectionInterval;
+    PlayerCollectionInterval   = Settings->PlayerCollectionInterval;
+    LegacyBufferFlushInterval  = Settings->LegacyBufferFlushInterval;
+    BatchSize                  = Settings->BatchSize;
+    bCollectProductionData     = Settings->bCollectProductionData;
+    bCollectVehicleData        = Settings->bCollectVehicleData;
+    bCollectPlayerData         = Settings->bCollectPlayerData;
+    bCollectPowerData          = Settings->bCollectPowerData;
+    bCollectLayoutData         = Settings->bCollectLayoutData;
 
     UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Config loaded - URL: %s | Mode: %s"),
         *SplunkURL, bUseMetricsMode ? TEXT("Metrics") : TEXT("Events"));
+    if (!bUseMetricsMode)
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Log,
+            TEXT("SplunkExporter: Legacy intervals - Power: %.1fs  Production: %.1fs  Vehicles: %.1fs  Players: %.1fs"),
+            PowerCollectionInterval, ProductionCollectionInterval, VehicleCollectionInterval, PlayerCollectionInterval);
+    }
 
     if (!Settings->IsConfigured())
     {
@@ -119,16 +129,30 @@ void ASplunkExporter::StartDataCollection()
         }
         else
         {
-            // Legacy mode: detailed events
-            TimerManager.SetTimer(
-                DataCollectionTimer,
-                this,
-                &ASplunkExporter::CollectAndSendData,
-                CollectionInterval,
-                true
-            );
+            // Legacy mode: each data type on its own independent timer
+            if (bCollectPowerData)
+            {
+                TimerManager.SetTimer(PowerCollectionTimer, this, &ASplunkExporter::CollectPowerData, PowerCollectionInterval, true);
+            }
+            if (bCollectProductionData)
+            {
+                TimerManager.SetTimer(ProductionCollectionTimer, this, &ASplunkExporter::CollectProductionData, ProductionCollectionInterval, true);
+            }
+            if (bCollectVehicleData)
+            {
+                TimerManager.SetTimer(VehicleCollectionTimer, this, &ASplunkExporter::CollectAllVehicleData, VehicleCollectionInterval, true);
+            }
+            if (bCollectPlayerData)
+            {
+                TimerManager.SetTimer(PlayerCollectionTimer, this, &ASplunkExporter::CollectPlayerMovementSystems, PlayerCollectionInterval, true);
+            }
 
-            UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Events mode started (interval: %.1fs)"), CollectionInterval);
+            // Shared buffer flush timer for legacy mode
+            TimerManager.SetTimer(LegacyBufferFlushTimer, this, &ASplunkExporter::CheckAndFlushBuffer, LegacyBufferFlushInterval, true);
+
+            UE_LOG(LogSatisfactorySplunkMod, Log,
+                TEXT("SplunkExporter: Events mode started - Power: %.1fs  Production: %.1fs  Vehicles: %.1fs  Players: %.1fs  Flush: %.1fs"),
+                PowerCollectionInterval, ProductionCollectionInterval, VehicleCollectionInterval, PlayerCollectionInterval, LegacyBufferFlushInterval);
         }
 
         bIsCollecting = true;
@@ -144,7 +168,11 @@ void ASplunkExporter::StopDataCollection()
         FTimerManager& TimerManager = World->GetTimerManager();
         TimerManager.ClearTimer(MetricsCollectionTimer);
         TimerManager.ClearTimer(BufferFlushTimer);
-        TimerManager.ClearTimer(DataCollectionTimer);
+        TimerManager.ClearTimer(PowerCollectionTimer);
+        TimerManager.ClearTimer(ProductionCollectionTimer);
+        TimerManager.ClearTimer(VehicleCollectionTimer);
+        TimerManager.ClearTimer(PlayerCollectionTimer);
+        TimerManager.ClearTimer(LegacyBufferFlushTimer);
         bIsCollecting = false;
         UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data collection stopped"));
     }

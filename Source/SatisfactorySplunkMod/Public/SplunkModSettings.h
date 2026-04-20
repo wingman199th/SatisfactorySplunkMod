@@ -33,7 +33,7 @@ public:
 
     /**
      * True  = Metrics mode: fast aggregated totals sent every second (recommended).
-     * False = Events mode: detailed per-machine events sent in batches.
+     * False = Events mode: detailed per-machine events on independent timers.
      */
     UPROPERTY(Config, EditAnywhere, Category = "Collection")
     bool bUseMetricsMode = true;
@@ -51,14 +51,51 @@ public:
     float BufferFlushInterval = 1.0f;
 
     // ---------------------------------------------------------------
-    // Legacy Events Mode Settings (used when bUseMetricsMode=False)
+    // Legacy Events Mode - Per-type collection intervals
+    // Each data type has its own timer so high-priority data (power)
+    // can be collected more frequently than low-priority data (players).
     // ---------------------------------------------------------------
 
-    /** Seconds between detailed collection cycles (default: 30.0) */
+    /**
+     * How often to collect power generator data, in seconds.
+     * Keep this low - power fluctuations happen fast (brownouts, etc).
+     * Default: 2.0
+     */
     UPROPERTY(Config, EditAnywhere, Category = "Legacy Events Mode")
-    float CollectionInterval = 30.0f;
+    float PowerCollectionInterval = 2.0f;
 
-    /** Buffer this many events before sending to Splunk (default: 10) */
+    /**
+     * How often to collect manufacturer and extractor data, in seconds.
+     * Efficiency changes slowly so this can be less frequent.
+     * Default: 10.0
+     */
+    UPROPERTY(Config, EditAnywhere, Category = "Legacy Events Mode")
+    float ProductionCollectionInterval = 10.0f;
+
+    /**
+     * How often to collect vehicle positions, fuel, and cargo, in seconds.
+     * Default: 5.0
+     */
+    UPROPERTY(Config, EditAnywhere, Category = "Legacy Events Mode")
+    float VehicleCollectionInterval = 5.0f;
+
+    /**
+     * How often to collect player position and equipment data, in seconds.
+     * Players move around but this data is low priority for most dashboards.
+     * Default: 30.0
+     */
+    UPROPERTY(Config, EditAnywhere, Category = "Legacy Events Mode")
+    float PlayerCollectionInterval = 30.0f;
+
+    /**
+     * How often to flush the data buffer to Splunk in legacy events mode, in seconds.
+     * Should be <= the shortest collection interval above.
+     * Default: 5.0
+     */
+    UPROPERTY(Config, EditAnywhere, Category = "Legacy Events Mode")
+    float LegacyBufferFlushInterval = 5.0f;
+
+    /** Buffer this many events before flushing (whichever comes first: size or time) */
     UPROPERTY(Config, EditAnywhere, Category = "Legacy Events Mode")
     int32 BatchSize = 10;
 
