@@ -5,7 +5,8 @@
 
 USplunkGameWorldModule::USplunkGameWorldModule()
 {
-    // Tell SML this is the root module for this mod so it is auto-discovered
+    // Root module: SML discovers this class automatically and dispatches
+    // lifecycle events for every game world (save) that loads.
     bRootModule = true;
 }
 
@@ -13,32 +14,31 @@ void USplunkGameWorldModule::DispatchLifecycleEvent(ELifecyclePhase Phase)
 {
     Super::DispatchLifecycleEvent(Phase);
 
-    if (Phase == ELifecyclePhase::INITIALIZATION)
+    // POST_INITIALIZATION: all game subsystems (railroad, circuits, ...) exist.
+    if (Phase != ELifecyclePhase::POST_INITIALIZATION)
     {
-        UWorld* World = GetWorld();
-        if (!World)
-        {
-            UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkGameWorldModule: No world context during INITIALIZATION"));
-            return;
-        }
+        return;
+    }
 
-        FActorSpawnParameters SpawnParams;
-        SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkGameWorldModule: no world during POST_INITIALIZATION"));
+        return;
+    }
 
-        ASplunkExporter* Exporter = World->SpawnActor<ASplunkExporter>(
-            ASplunkExporter::StaticClass(),
-            FVector::ZeroVector,
-            FRotator::ZeroRotator,
-            SpawnParams
-        );
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
-        if (Exporter)
-        {
-            UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkGameWorldModule: SplunkExporter spawned successfully"));
-        }
-        else
-        {
-            UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkGameWorldModule: Failed to spawn SplunkExporter"));
-        }
+    ASplunkExporter* Exporter = World->SpawnActor<ASplunkExporter>(
+        ASplunkExporter::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
+
+    if (Exporter)
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkGameWorldModule: SplunkExporter spawned"));
+    }
+    else
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkGameWorldModule: failed to spawn SplunkExporter"));
     }
 }

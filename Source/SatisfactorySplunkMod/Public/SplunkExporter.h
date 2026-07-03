@@ -1,44 +1,29 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Engine/World.h"
 #include "GameFramework/Actor.h"
-#include "Http.h"
-#include "Json.h"
 #include "Dom/JsonObject.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonWriter.h"
-#include "TimerManager.h"
-
-// Satisfactory includes
-#include "Buildables/FGBuildableManufacturer.h"
-#include "Buildables/FGBuildableResourceExtractor.h"
-#include "Buildables/FGBuildable.h"
-#include "Buildables/FGBuildableSubsystem.h"
-#include "Buildables/FGBuildablePowerGenerator.h"
-#include "FGPowerInfoComponent.h"
-#include "FGPowerCircuit.h"
-#include "FGBuildableDockingStation.h"
-#include "FGWheeledVehicle.h"
-#include "FGTrain.h"
-#include "FGRailroadVehicle.h"
-#include "FGLocomotive.h"
-#include "FGFreightWagon.h"
-#include "FGRailroadTimeTable.h"
-#include "FGTrainStationIdentifier.h"
-#include "FGCharacterPlayer.h"
-#include "Equipment/FGJetPack.h"
-#include "Components/FGInventoryComponent.h"
-#include "FGItemDescriptor.h"
-#include "FGItemDescriptorNuclearFuel.h"
-#include "FGItemDescriptorBiomass.h"
-#include "FGRecipe.h"
-#include "GameFramework/CharacterMovementComponent.h"
-
-#include "SplunkModSettings.h"
+#include "Http.h"
 #include "SplunkExporter.generated.h"
 
-UCLASS(BlueprintType, Blueprintable)
+/**
+ * Collects factory telemetry on independent timers and ships it to a
+ * Splunk HTTP Event Collector (HEC) endpoint as batched JSON events.
+ *
+ * Spawned automatically by USplunkGameWorldModule when a save loads.
+ * Configuration is read from Config/SatisfactorySplunkMod.ini inside the
+ * installed mod folder (see LoadSettingsFromConfig).
+ *
+ * Sourcetypes emitted:
+ *   satisfactory:summary     - aggregate counts / power / productivity
+ *   satisfactory:power       - one event per power circuit
+ *   satisfactory:production  - one event per manufacturer and extractor,
+ *                              with throughput and a "waiting for" status
+ *   satisfactory:inventory   - one event per item type stored in containers
+ *   satisfactory:vehicle     - trucks, trains and freight wagon cargo
+ *   satisfactory:player      - player positions
+ */
+UCLASS()
 class SATISFACTORYSPLUNKMOD_API ASplunkExporter : public AActor
 {
     GENERATED_BODY()
@@ -58,119 +43,69 @@ public:
     void StopDataCollection();
 
     UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
-    void CollectAndSendData();
-
-    UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
-    void SendBufferedData();
+    void FlushBuffer();
 
     UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
     void LoadSettingsFromConfig();
 
 private:
-    // ---------------------------------------------------------------
-    // Metrics mode collectors (aggregated totals)
-    // ---------------------------------------------------------------
-    void CollectPowerMetrics();
-    void CollectProductionMetrics();
-    void CollectVehicleMetrics();
-    void CollectPlayerMetrics();
+    // Collectors - one per timer
+    void CollectSummary();
+    void CollectPower();
+    void CollectProduction();
+    void CollectInventory();
+    void CollectVehicles();
+    void CollectPlayers();
 
-    // ---------------------------------------------------------------
-    // Events mode collectors (detailed per-machine data)
-    // ---------------------------------------------------------------
-    void CollectProductionData();
-    void CollectPowerData();
-    void CollectAllVehicleData();
-    void CollectPersonalVehicles();
-    void CollectAutomatedVehicles();
-    void CollectTrainData();
-    void CollectPlayerMovementSystems();
-    void CollectFactoryLayoutData();
-
-    // Buffer flush (shared by both modes)
-    void CheckAndFlushBuffer();
+    // Event helpers
+    TSharedPtr<FJsonObject> CreateEvent(const FString& SourceType) const;
+    void AddEventToBuffer(const TSharedPtr<FJsonObject>& EventObject);
 
     // HTTP
-    void SendDataToSplunk(const FString& JsonData);
-    void SendLayoutDataToSplunk(TSharedPtr<FJsonObject> LayoutData);
+    void SendToSplunk(const FString& Payload, int32 EventCount);
     void OnHttpResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful);
 
-    // Utilities
-    FString GetVehicleTypeFromClass(const FString& ClassName);
-    void AddEventToBuffer(TSharedPtr<FJsonObject> EventObject);
-    TSharedPtr<FJsonObject> CreateBaseEvent(const FString& SourceType);
-    TSharedPtr<FJsonObject> CreateMetricsEvent();
+    bool IsConfigured() const;
 
 private:
-    // One independent timer per data type + one flush timer
+    FTimerHandle SummaryTimer;
     FTimerHandle PowerTimer;
     FTimerHandle ProductionTimer;
+    FTimerHandle InventoryTimer;
     FTimerHandle VehicleTimer;
     FTimerHandle PlayerTimer;
-    FTimerHandle BufferFlushTimer;
+    FTimerHandle FlushTimer;
 
-    // Data buffer
     TArray<TSharedPtr<FJsonObject>> DataBuffer;
-    FDateTime LastBufferFlush;
+    FString HostName;
 
     // ---------------------------------------------------------------
-    // Configuration (loaded from ini via LoadSettingsFromConfig)
+    // Configuration (Config/SatisfactorySplunkMod.ini)
     // ---------------------------------------------------------------
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Splunk Configuration", meta = (AllowPrivateAccess = "true"))
-    FString SplunkURL = TEXT("https://your-splunk-instance:8088/services/collector");
+    FString SplunkURL;
+    FString HECToken;
+    FString SplunkIndex;   // optional, empty = token default
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Splunk Configuration", meta = (AllowPrivateAccess = "true"))
-    FString HECToken = TEXT("your-hec-token-here");
+    float SummaryInterval    = 5.0f;
+    float PowerInterval      = 5.0f;
+    float ProductionInterval = 30.0f;
+    float InventoryInterval  = 30.0f;
+    float VehicleInterval    = 10.0f;
+    float PlayerInterval     = 10.0f;
+    float FlushInterval      = 5.0f;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection", meta = (AllowPrivateAccess = "true"))
-    bool bUseMetricsMode = true;
+    bool bCollectSummary    = true;
+    bool bCollectPower      = true;
+    bool bCollectProduction = true;
+    bool bCollectInventory  = true;
+    bool bCollectVehicles   = true;
+    bool bCollectPlayers    = true;
 
-    // Intervals (seconds) - apply to both metrics and events mode
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Intervals", meta = (AllowPrivateAccess = "true"))
-    float PowerInterval = 2.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Intervals", meta = (AllowPrivateAccess = "true"))
-    float ProductionInterval = 10.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Intervals", meta = (AllowPrivateAccess = "true"))
-    float VehicleInterval = 5.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Intervals", meta = (AllowPrivateAccess = "true"))
-    float PlayerInterval = 30.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Collection Intervals", meta = (AllowPrivateAccess = "true"))
-    float BufferFlushInterval = 5.0f;
-
-    // What to collect
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Data Types", meta = (AllowPrivateAccess = "true"))
-    bool bCollectPowerData = true;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Data Types", meta = (AllowPrivateAccess = "true"))
-    bool bCollectProductionData = true;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Data Types", meta = (AllowPrivateAccess = "true"))
-    bool bCollectVehicleData = true;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Data Types", meta = (AllowPrivateAccess = "true"))
-    bool bCollectPlayerData = true;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Data Types", meta = (AllowPrivateAccess = "true"))
-    bool bCollectLayoutData = false;
-
-    // Events mode only
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Events Mode", meta = (AllowPrivateAccess = "true"))
-    int32 BatchSize = 10;
+    int32 MaxBufferedEvents = 2000;
 
     // Status
-    UPROPERTY(BlueprintReadOnly, Category = "Status", meta = (AllowPrivateAccess = "true"))
-    bool bIsCollecting = false;
-
-    UPROPERTY(BlueprintReadOnly, Category = "Status", meta = (AllowPrivateAccess = "true"))
+    bool  bIsCollecting   = false;
+    int32 BatchesSent     = 0;
     int32 EventsSentTotal = 0;
-
-    UPROPERTY(BlueprintReadOnly, Category = "Status", meta = (AllowPrivateAccess = "true"))
-    int32 EventsInBuffer = 0;
-
-    UPROPERTY(BlueprintReadOnly, Category = "Status", meta = (AllowPrivateAccess = "true"))
-    FDateTime LastSuccessfulSend;
+    int32 EventsDropped   = 0;
 };

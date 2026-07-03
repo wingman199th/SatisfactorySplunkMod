@@ -1,12 +1,12 @@
 {
     "FileVersion": 3,
-    "Version": 1,
-    "VersionName": "1.0.0",
-    "SemVersion": "1.0.0",
+    "Version": 2,
+    "VersionName": "2.0.0",
+    "SemVersion": "2.0.0",
     "FriendlyName": "Satisfactory Splunk Exporter",
-    "Description": "Exports production, vehicle, and player data to Splunk for analytics. Edit Config/DefaultSatisfactorySplunkMod.ini to set your Splunk URL and HEC token.",
+    "Description": "Exports factory telemetry (production throughput, machine status, power, storage inventory, vehicles, trains, player positions) to a Splunk HTTP Event Collector. Configure via Config/SatisfactorySplunkMod.ini.",
     "Category": "Modding",
-    "CreatedBy": "Community",
+    "CreatedBy": "wingman199th",
     "CreatedByURL": "",
     "DocsURL": "",
     "MarketplaceURL": "",
@@ -15,7 +15,8 @@
     "IsBetaVersion": false,
     "IsExperimentalVersion": false,
     "Installed": false,
-    "GameVersion": ">=365306",
+    "GameVersion": ">=491125",
+    "AcceptsAnyRemoteVersion": true,
     "Modules": [
         {
             "Name": "SatisfactorySplunkMod",
@@ -26,7 +27,7 @@
     "Plugins": [
         {
             "Name": "SML",
-            "SemVersion": "^3.6.0",
+            "SemVersion": "^3.12.0",
             "Enabled": true
         }
     ]

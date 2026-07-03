@@ -1,191 +1,64 @@
 ============================================================
- Satisfactory Splunk Exporter Mod - Installation Guide
+ Satisfactory Splunk Exporter - Installation (v2.0)
 ============================================================
 
-REQUIREMENTS
-------------
-- Satisfactory (Steam or Epic Games version, Update 8 or later)
-- Satisfactory Mod Loader (SML) version 3.6.0 or later
-- A Splunk instance with HTTP Event Collector (HEC) enabled
-- A Splunk HEC token (see Step 3 below)
+This is a C++ SML mod. It cannot be installed by copying source
+files into the game - it must be COMPILED once with the official
+Satisfactory modding toolchain, then packaged with Alpakit.
 
+STEP 1 - Build the mod
+----------------------
+Follow the official SML development setup guide:
+  https://docs.ficsit.app/satisfactory-modding/latest/Development/BeginnersGuide/index.html
 
-------------------------------------------------------------
-STEP 1 - Install Satisfactory Mod Loader (SML)
-------------------------------------------------------------
-If you already have SML 3.6.0+ installed, skip to Step 2.
+Summary:
+  1. Install Visual Studio 2022 (C++ game dev workload) and Wwise.
+  2. git clone https://github.com/satisfactorymodding/SatisfactoryModLoader.git
+  3. Install the custom engine (Unreal Engine - CSS) per the guide.
+  4. Copy this repository to:
+       SatisfactoryModLoader/Mods/SatisfactorySplunkMod/
+     (the folder that contains SatisfactorySplunkMod.uplugin)
+  5. Generate VS project files for FactoryGame.uproject, build the
+     "Development Editor" target.
+  6. Open the editor, Window -> Alpakit, select SatisfactorySplunkMod,
+     click "Alpakit!". It packages the mod and copies it into your
+     game's FactoryGame/Mods/ folder.
 
-1. Download the Satisfactory Mod Manager from:
-   https://smm.ficsit.app
+STEP 2 - Set up Splunk HEC
+--------------------------
+  1. Splunk: Settings -> Data Inputs -> HTTP Event Collector -> New Token.
+     Choose/create an events index (e.g. "satisfactory"). Copy the token.
+  2. IMPORTANT: the default HEC SSL certificate is self-signed and the
+     game will reject it. On a LAN, disable SSL in HEC Global Settings
+     and use http://your-server:8088/services/collector/event
+  3. Verify with curl from the gaming machine:
+       curl http://your-splunk:8088/services/collector/event \
+         -H "Authorization: Splunk YOUR-TOKEN" -d '{"event":"test"}'
+     Expected: {"text":"Success","code":0}
 
-2. Run the installer and follow the prompts.
+STEP 3 - Configure the mod
+--------------------------
+Edit, inside the INSTALLED mod folder:
+  <game>/FactoryGame/Mods/SatisfactorySplunkMod/Config/SatisfactorySplunkMod.ini
 
-3. Launch the Mod Manager, point it at your Satisfactory
-   install directory, and let it install SML.
+Set:
+  SplunkURL=http://your-splunk:8088/services/collector/event
+  HECToken=<your token>
 
-4. Launch Satisfactory once through the Mod Manager to
-   confirm SML is working before continuing.
+(Or set env vars SPLUNK_HEC_URL / SPLUNK_HEC_TOKEN - useful for
+dedicated servers. They override the ini.)
 
+STEP 4 - Verify
+---------------
+Start the game, load a save, then check:
+  <game>/FactoryGame/Saved/Logs/FactoryGame.log
+Look for:
+  LogSatisfactorySplunkMod: SplunkGameWorldModule: SplunkExporter spawned
+  LogSatisfactorySplunkMod: SplunkExporter: collection started (...)
+  LogSatisfactorySplunkMod: SplunkExporter: HTTP 200 - 1 batches ...
 
-------------------------------------------------------------
-STEP 2 - Install the Mod
-------------------------------------------------------------
-1. Copy the entire SatisfactorySplunkMod folder into your
-   Satisfactory mods directory:
+In Splunk:
+  index=satisfactory | head 10
 
-   Steam install:
-   C:\Program Files (x86)\Steam\steamapps\common\Satisfactory\FactoryGame\Mods\
-
-   Epic Games install:
-   C:\Program Files\Epic Games\SatisfactoryEarlyAccess\FactoryGame\Mods\
-
-   After copying, the path should look like:
-   ...\Mods\SatisfactorySplunkMod\SatisfactorySplunkMod.uplugin
-
-2. Verify the folder structure looks like this:
-   Mods\
-   └── SatisfactorySplunkMod\
-       ├── SatisfactorySplunkMod.uplugin
-       ├── Config\
-       │   └── DefaultSatisfactorySplunkMod.ini   <-- you edit this
-       ├── Source\
-       └── ...
-
-   NOTE: The mod folder must be placed inside the Mods\
-   directory, NOT the Plugins\ directory.
-
-
-------------------------------------------------------------
-STEP 3 - Generate a Splunk HEC Token
-------------------------------------------------------------
-If you already have an HEC token, skip to Step 4.
-
-1. Log in to your Splunk web interface.
-
-2. Go to: Settings > Data Inputs > HTTP Event Collector
-
-3. Click "New Token".
-
-4. Give it a name (e.g. "SatisfactoryMod") and click Next.
-
-5. On the Input Settings page:
-   - Source type: Select "Manual" and enter: satisfactory:metrics
-   - Index: Choose an existing index or create a new one
-     (e.g. "satisfactory")
-
-6. Click Review, then Submit.
-
-7. Copy the token value shown - you will need it in Step 4.
-
-8. Make sure HEC is enabled globally:
-   Settings > Data Inputs > HTTP Event Collector > Global Settings
-   Ensure "All Tokens" is set to Enabled.
-
-
-------------------------------------------------------------
-STEP 4 - Configure the Mod
-------------------------------------------------------------
-1. Open the config file in a plain text editor (e.g. Notepad):
-
-   ...\Mods\SatisfactorySplunkMod\Config\DefaultSatisfactorySplunkMod.ini
-
-2. Set your Splunk URL. Examples:
-   SplunkURL=https://splunk.mycompany.com:8088/services/collector
-   SplunkURL=http://192.168.1.50:8088/services/collector
-
-3. Paste your HEC token from Step 3:
-   HECToken=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-
-4. Save the file.
-
-   Optional settings you may want to review:
-   - bUseMetricsMode     : True = fast summary data (recommended)
-                           False = detailed per-machine events
-   - MetricsInterval     : how often data is collected (seconds)
-   - BufferFlushInterval : how often data is sent to Splunk (seconds)
-
-
-------------------------------------------------------------
-STEP 5 - Launch and Verify
-------------------------------------------------------------
-The mod uses SML's module system to start automatically when
-you load a save. You do NOT need to place any actor in your
-world - the mod handles everything on its own.
-
-1. Launch Satisfactory and load your save (or start a new one).
-
-2. The mod will start collecting and sending data immediately.
-
-3. In Splunk, open Search & Reporting and run:
-   index=satisfactory sourcetype=satisfactory:metrics
-
-   You should see events appearing within a few seconds.
-
-4. If no events appear, check the Satisfactory log file:
-   %APPDATA%\Local\FactoryGame\Saved\Logs\FactoryGame.log
-
-   Look for lines containing "SplunkExporter" or
-   "SplunkGameWorldModule" to diagnose the issue.
-
-   Common log messages:
-   - "SplunkExporter spawned successfully" = mod is running
-   - "Config loaded"                        = ini file was read
-   - "HEC Token is not set"                 = check Step 4
-   - "HTTP 401"                             = HEC token is wrong
-   - "HTTP 403"                             = HEC disabled in Splunk
-   - "Network error"                        = Splunk URL unreachable
-
-
-------------------------------------------------------------
-TROUBLESHOOTING
-------------------------------------------------------------
-Problem : No data in Splunk and no SplunkExporter log entries
-Solution: Confirm the mod folder is inside Mods\ (not Plugins\)
-          and that SML version is 3.6.0 or later.
-
-Problem : "HEC Token is not set" in log
-Solution: Edit Config/DefaultSatisfactorySplunkMod.ini and
-          set HECToken to your actual token, then restart.
-
-Problem : HTTP 401 Unauthorized
-Solution: Your HECToken is incorrect. Re-copy it from Splunk
-          (Settings > Data Inputs > HTTP Event Collector).
-
-Problem : HTTP 403 Forbidden
-Solution: HEC is disabled globally in Splunk. Go to
-          Settings > Data Inputs > HTTP Event Collector >
-          Global Settings and enable it.
-
-Problem : Network error / cannot reach Splunk
-Solution: Check that SplunkURL is correct and that port 8088
-          is open on your Splunk server firewall. Test by
-          pasting the URL into a browser - you should get a
-          JSON response from Splunk HEC.
-
-Problem : Game refuses to launch / "mod version mismatch"
-Solution: Update Satisfactory to Update 8 or later, and
-          update SML to version 3.6.0 or later via the
-          Satisfactory Mod Manager.
-
-Problem : Game crashes on startup after installing
-Solution: Verify SML is installed and up to date. The mod
-          requires SML 3.6.0+ to load correctly.
-
-
-------------------------------------------------------------
-UNINSTALLING
-------------------------------------------------------------
-1. Remove the SatisfactorySplunkMod folder from the Mods
-   directory.
-2. Because the mod auto-spawns its actor (not saved to your
-   save file), no save file cleanup is required.
-
-
-------------------------------------------------------------
-SUPPORT
-------------------------------------------------------------
-For issues or questions, refer to the README.md included
-with the mod for additional Splunk query examples and
-architecture details.
-
-============================================================
+See README.md for the full list of sourcetypes, example searches,
+and troubleshooting.

@@ -1,61 +1,86 @@
 #include "SplunkExporter.h"
 #include "SatisfactorySplunkMod.h"
+
+#include "EngineUtils.h"
 #include "Engine/World.h"
-#include "Kismet/GameplayStatics.h"
-#include "EngineIterator.h"
+#include "TimerManager.h"
+#include "UObject/UObjectIterator.h"
+#include "GameFramework/PlayerState.h"
+
+#include "HttpModule.h"
+#include "Interfaces/IHttpResponse.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
+
+#include "Misc/ConfigCacheIni.h"
+#include "Misc/Paths.h"
+#include "Interfaces/IPluginManager.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/PlatformMisc.h"
+
+// FactoryGame
+#include "Buildables/FGBuildableManufacturer.h"
+#include "Buildables/FGBuildableResourceExtractor.h"
+#include "Buildables/FGBuildableGenerator.h"
+#include "Buildables/FGBuildableGeneratorFuel.h"
+#include "Buildables/FGBuildableStorage.h"
+#include "FGPowerCircuit.h"
+#include "FGPowerInfoComponent.h"
+#include "FGInventoryComponent.h"
+#include "FGRecipe.h"
+#include "Resources/FGItemDescriptor.h"
+#include "Resources/FGResourceDescriptor.h"
+#include "Resources/FGExtractableResourceInterface.h"
+#include "FGCharacterPlayer.h"
+#include "WheeledVehicles/FGWheeledVehicle.h"
+#include "FGRailroadSubsystem.h"
+#include "FGTrain.h"
+#include "FGRailroadVehicle.h"
+#include "FGFreightWagon.h"
+#include "FGRailroadTimeTable.h"
+#include "FGTrainStationIdentifier.h"
+
+namespace
+{
+    // cm/s -> km/h
+    constexpr float SpeedToKmh = 0.036f;
+
+    FString ItemName(TSubclassOf<UFGItemDescriptor> ItemClass)
+    {
+        return ItemClass ? UFGItemDescriptor::GetItemName(ItemClass).ToString() : TEXT("Unknown");
+    }
+
+    void SetLocationFields(const TSharedPtr<FJsonObject>& Obj, const FVector& Location)
+    {
+        Obj->SetNumberField(TEXT("x"), Location.X);
+        Obj->SetNumberField(TEXT("y"), Location.Y);
+        Obj->SetNumberField(TEXT("z"), Location.Z);
+    }
+}
 
 ASplunkExporter::ASplunkExporter()
 {
     PrimaryActorTick.bCanEverTick = false;
     bReplicates = false;
-
-    EventsInBuffer = 0;
-    EventsSentTotal = 0;
-    bIsCollecting = false;
-    LastBufferFlush = FDateTime::Now();
+    HostName = FPlatformProcess::ComputerName();
 }
 
-void ASplunkExporter::LoadSettingsFromConfig()
-{
-    USplunkModSettings* Settings = USplunkModSettings::Get();
-    if (!Settings)
-    {
-        UE_LOG(LogSatisfactorySplunkMod, Warning, TEXT("SplunkExporter: Could not load mod settings"));
-        return;
-    }
-
-    SplunkURL             = Settings->SplunkURL;
-    HECToken              = Settings->HECToken;
-    bUseMetricsMode       = Settings->bUseMetricsMode;
-    PowerInterval         = Settings->PowerInterval;
-    ProductionInterval    = Settings->ProductionInterval;
-    VehicleInterval       = Settings->VehicleInterval;
-    PlayerInterval        = Settings->PlayerInterval;
-    BufferFlushInterval   = Settings->BufferFlushInterval;
-    BatchSize             = Settings->BatchSize;
-    bCollectPowerData     = Settings->bCollectPowerData;
-    bCollectProductionData = Settings->bCollectProductionData;
-    bCollectVehicleData   = Settings->bCollectVehicleData;
-    bCollectPlayerData    = Settings->bCollectPlayerData;
-    bCollectLayoutData    = Settings->bCollectLayoutData;
-
-    UE_LOG(LogSatisfactorySplunkMod, Log,
-        TEXT("SplunkExporter: Config loaded - Mode: %s | Power: %.1fs  Production: %.1fs  Vehicles: %.1fs  Players: %.1fs  Flush: %.1fs"),
-        bUseMetricsMode ? TEXT("Metrics") : TEXT("Events"),
-        PowerInterval, ProductionInterval, VehicleInterval, PlayerInterval, BufferFlushInterval);
-
-    if (!Settings->IsConfigured())
-    {
-        UE_LOG(LogSatisfactorySplunkMod, Warning,
-            TEXT("SplunkExporter: HEC token and/or Splunk URL are still placeholders. ")
-            TEXT("Edit Config/DefaultSatisfactorySplunkMod.ini and restart."));
-    }
-}
+// ---------------------------------------------------------------------------
+// Lifecycle / configuration
+// ---------------------------------------------------------------------------
 
 void ASplunkExporter::BeginPlay()
 {
     Super::BeginPlay();
-    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Starting up"));
+
+    // Only the authority (host / dedicated server) has the full factory state.
+    if (!HasAuthority())
+    {
+        return;
+    }
+
+    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: starting up"));
     LoadSettingsFromConfig();
     StartDataCollection();
 }
@@ -63,978 +88,707 @@ void ASplunkExporter::BeginPlay()
 void ASplunkExporter::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     StopDataCollection();
-    if (DataBuffer.Num() > 0)
-    {
-        SendBufferedData();
-    }
+    FlushBuffer();
     Super::EndPlay(EndPlayReason);
+}
+
+void ASplunkExporter::LoadSettingsFromConfig()
+{
+    FString ConfigPath;
+    TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("SatisfactorySplunkMod"));
+    if (Plugin.IsValid())
+    {
+        ConfigPath = Plugin->GetBaseDir() / TEXT("Config") / TEXT("SatisfactorySplunkMod.ini");
+    }
+
+    if (!ConfigPath.IsEmpty() && FPaths::FileExists(ConfigPath))
+    {
+        FConfigFile Ini;
+        Ini.Read(ConfigPath);
+
+        Ini.GetString(TEXT("Splunk"), TEXT("SplunkURL"), SplunkURL);
+        Ini.GetString(TEXT("Splunk"), TEXT("HECToken"), HECToken);
+        Ini.GetString(TEXT("Splunk"), TEXT("Index"), SplunkIndex);
+
+        Ini.GetFloat(TEXT("Collection"), TEXT("SummaryInterval"), SummaryInterval);
+        Ini.GetFloat(TEXT("Collection"), TEXT("PowerInterval"), PowerInterval);
+        Ini.GetFloat(TEXT("Collection"), TEXT("ProductionInterval"), ProductionInterval);
+        Ini.GetFloat(TEXT("Collection"), TEXT("InventoryInterval"), InventoryInterval);
+        Ini.GetFloat(TEXT("Collection"), TEXT("VehicleInterval"), VehicleInterval);
+        Ini.GetFloat(TEXT("Collection"), TEXT("PlayerInterval"), PlayerInterval);
+        Ini.GetFloat(TEXT("Collection"), TEXT("FlushInterval"), FlushInterval);
+
+        Ini.GetBool(TEXT("Collection"), TEXT("bCollectSummary"), bCollectSummary);
+        Ini.GetBool(TEXT("Collection"), TEXT("bCollectPower"), bCollectPower);
+        Ini.GetBool(TEXT("Collection"), TEXT("bCollectProduction"), bCollectProduction);
+        Ini.GetBool(TEXT("Collection"), TEXT("bCollectInventory"), bCollectInventory);
+        Ini.GetBool(TEXT("Collection"), TEXT("bCollectVehicles"), bCollectVehicles);
+        Ini.GetBool(TEXT("Collection"), TEXT("bCollectPlayers"), bCollectPlayers);
+
+        Ini.GetInt(TEXT("Collection"), TEXT("MaxBufferedEvents"), MaxBufferedEvents);
+
+        UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: loaded config from %s"), *ConfigPath);
+    }
+    else
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Warning,
+            TEXT("SplunkExporter: config file not found at '%s'"), *ConfigPath);
+    }
+
+    // Environment variables override the ini - handy for dedicated servers.
+    const FString EnvUrl = FPlatformMisc::GetEnvironmentVariable(TEXT("SPLUNK_HEC_URL"));
+    const FString EnvToken = FPlatformMisc::GetEnvironmentVariable(TEXT("SPLUNK_HEC_TOKEN"));
+    if (!EnvUrl.IsEmpty())   { SplunkURL = EnvUrl; }
+    if (!EnvToken.IsEmpty()) { HECToken = EnvToken; }
+
+    // Clamp intervals so a bad config can't spin-loop the game thread.
+    SummaryInterval    = FMath::Max(1.0f, SummaryInterval);
+    PowerInterval      = FMath::Max(1.0f, PowerInterval);
+    ProductionInterval = FMath::Max(1.0f, ProductionInterval);
+    InventoryInterval  = FMath::Max(1.0f, InventoryInterval);
+    VehicleInterval    = FMath::Max(1.0f, VehicleInterval);
+    PlayerInterval     = FMath::Max(1.0f, PlayerInterval);
+    FlushInterval      = FMath::Max(1.0f, FlushInterval);
+    MaxBufferedEvents  = FMath::Max(100, MaxBufferedEvents);
+}
+
+bool ASplunkExporter::IsConfigured() const
+{
+    return !SplunkURL.IsEmpty()
+        && !HECToken.IsEmpty()
+        && !SplunkURL.Contains(TEXT("your-splunk"))
+        && !HECToken.Contains(TEXT("your-hec-token"));
 }
 
 void ASplunkExporter::StartDataCollection()
 {
-    if (HECToken.IsEmpty() || HECToken == TEXT("your-hec-token-here"))
+    if (!IsConfigured())
     {
         UE_LOG(LogSatisfactorySplunkMod, Error,
-            TEXT("SplunkExporter: HEC Token is not set. Edit Config/DefaultSatisfactorySplunkMod.ini and restart."));
-        return;
-    }
-    if (SplunkURL.IsEmpty() || SplunkURL == TEXT("https://your-splunk-instance:8088/services/collector"))
-    {
-        UE_LOG(LogSatisfactorySplunkMod, Error,
-            TEXT("SplunkExporter: Splunk URL is not set. Edit Config/DefaultSatisfactorySplunkMod.ini and restart."));
+            TEXT("SplunkExporter: SplunkURL / HECToken not configured. ")
+            TEXT("Edit Config/SatisfactorySplunkMod.ini in the mod folder (or set the ")
+            TEXT("SPLUNK_HEC_URL / SPLUNK_HEC_TOKEN environment variables) and restart."));
         return;
     }
 
     UWorld* World = GetWorld();
-    if (!World || bIsCollecting) return;
+    if (!World || bIsCollecting)
+    {
+        return;
+    }
 
     FTimerManager& TM = World->GetTimerManager();
-
-    // Each data type gets its own independent timer.
-    // In metrics mode the timer calls an aggregated collector.
-    // In events mode the timer calls a detailed per-machine collector.
-    // The same interval settings apply to both modes.
-
-    if (bCollectPowerData)
-    {
-        TM.SetTimer(PowerTimer, this,
-            bUseMetricsMode ? &ASplunkExporter::CollectPowerMetrics : &ASplunkExporter::CollectPowerData,
-            PowerInterval, true);
-    }
-    if (bCollectProductionData)
-    {
-        TM.SetTimer(ProductionTimer, this,
-            bUseMetricsMode ? &ASplunkExporter::CollectProductionMetrics : &ASplunkExporter::CollectProductionData,
-            ProductionInterval, true);
-    }
-    if (bCollectVehicleData)
-    {
-        TM.SetTimer(VehicleTimer, this,
-            bUseMetricsMode ? &ASplunkExporter::CollectVehicleMetrics : &ASplunkExporter::CollectAllVehicleData,
-            VehicleInterval, true);
-    }
-    if (bCollectPlayerData)
-    {
-        TM.SetTimer(PlayerTimer, this,
-            bUseMetricsMode ? &ASplunkExporter::CollectPlayerMetrics : &ASplunkExporter::CollectPlayerMovementSystems,
-            PlayerInterval, true);
-    }
-
-    TM.SetTimer(BufferFlushTimer, this, &ASplunkExporter::CheckAndFlushBuffer, BufferFlushInterval, true);
+    if (bCollectSummary)    { TM.SetTimer(SummaryTimer,    this, &ASplunkExporter::CollectSummary,    SummaryInterval,    true); }
+    if (bCollectPower)      { TM.SetTimer(PowerTimer,      this, &ASplunkExporter::CollectPower,      PowerInterval,      true); }
+    if (bCollectProduction) { TM.SetTimer(ProductionTimer, this, &ASplunkExporter::CollectProduction, ProductionInterval, true); }
+    if (bCollectInventory)  { TM.SetTimer(InventoryTimer,  this, &ASplunkExporter::CollectInventory,  InventoryInterval,  true); }
+    if (bCollectVehicles)   { TM.SetTimer(VehicleTimer,    this, &ASplunkExporter::CollectVehicles,   VehicleInterval,    true); }
+    if (bCollectPlayers)    { TM.SetTimer(PlayerTimer,     this, &ASplunkExporter::CollectPlayers,    PlayerInterval,     true); }
+    TM.SetTimer(FlushTimer, this, &ASplunkExporter::FlushBuffer, FlushInterval, true);
 
     bIsCollecting = true;
-    LastBufferFlush = FDateTime::Now();
-
     UE_LOG(LogSatisfactorySplunkMod, Log,
-        TEXT("SplunkExporter: Collection started (%s mode) - Power: %.1fs  Production: %.1fs  Vehicles: %.1fs  Players: %.1fs"),
-        bUseMetricsMode ? TEXT("Metrics") : TEXT("Events"),
-        PowerInterval, ProductionInterval, VehicleInterval, PlayerInterval);
+        TEXT("SplunkExporter: collection started (summary %.0fs, power %.0fs, production %.0fs, inventory %.0fs, vehicles %.0fs, players %.0fs, flush %.0fs)"),
+        SummaryInterval, PowerInterval, ProductionInterval, InventoryInterval, VehicleInterval, PlayerInterval, FlushInterval);
 }
 
 void ASplunkExporter::StopDataCollection()
 {
     UWorld* World = GetWorld();
-    if (!World || !bIsCollecting) return;
-
-    FTimerManager& TM = World->GetTimerManager();
-    TM.ClearTimer(PowerTimer);
-    TM.ClearTimer(ProductionTimer);
-    TM.ClearTimer(VehicleTimer);
-    TM.ClearTimer(PlayerTimer);
-    TM.ClearTimer(BufferFlushTimer);
-
-    bIsCollecting = false;
-    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data collection stopped"));
-}
-
-void ASplunkExporter::CollectAndSendData()
-{
-    if (!GetWorld())
+    if (!World || !bIsCollecting)
     {
-        UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkExporter: No valid world context"));
         return;
     }
-    
-    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Starting data collection cycle"));
-    
-    // Collect different types of data based on configuration
-    if (bCollectProductionData)
-    {
-        CollectProductionData();
-    }
-    
-    if (bCollectVehicleData)
-    {
-        CollectAllVehicleData();
-    }
-    
-    if (bCollectPlayerData)
-    {
-        CollectPlayerMovementSystems();
-    }
-    
-    if (bCollectPowerData)
-    {
-        CollectPowerData();
-    }
-    
-    // Update buffer count
-    EventsInBuffer = DataBuffer.Num();
-    
-    // Send buffered data if we have enough
-    if (DataBuffer.Num() >= BatchSize)
-    {
-        SendBufferedData();
-    }
-    
-    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Data collection cycle completed. Buffer size: %d"), DataBuffer.Num());
+
+    FTimerManager& TM = World->GetTimerManager();
+    TM.ClearTimer(SummaryTimer);
+    TM.ClearTimer(PowerTimer);
+    TM.ClearTimer(ProductionTimer);
+    TM.ClearTimer(InventoryTimer);
+    TM.ClearTimer(VehicleTimer);
+    TM.ClearTimer(PlayerTimer);
+    TM.ClearTimer(FlushTimer);
+
+    bIsCollecting = false;
+    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: collection stopped"));
 }
 
-void ASplunkExporter::SendBufferedData()
+// ---------------------------------------------------------------------------
+// Event helpers
+// ---------------------------------------------------------------------------
+
+TSharedPtr<FJsonObject> ASplunkExporter::CreateEvent(const FString& SourceType) const
+{
+    TSharedPtr<FJsonObject> Event = MakeShared<FJsonObject>();
+    Event->SetNumberField(TEXT("time"), static_cast<double>(FDateTime::UtcNow().ToUnixTimestamp()));
+    Event->SetStringField(TEXT("host"), HostName);
+    Event->SetStringField(TEXT("source"), TEXT("satisfactory-splunk-mod"));
+    Event->SetStringField(TEXT("sourcetype"), SourceType);
+    if (!SplunkIndex.IsEmpty())
+    {
+        Event->SetStringField(TEXT("index"), SplunkIndex);
+    }
+    return Event;
+}
+
+void ASplunkExporter::AddEventToBuffer(const TSharedPtr<FJsonObject>& EventObject)
+{
+    if (!EventObject.IsValid())
+    {
+        return;
+    }
+    if (DataBuffer.Num() >= MaxBufferedEvents)
+    {
+        // Splunk unreachable or flush interval too slow - drop oldest first.
+        DataBuffer.RemoveAt(0);
+        EventsDropped++;
+    }
+    DataBuffer.Add(EventObject);
+}
+
+// ---------------------------------------------------------------------------
+// Collectors
+// ---------------------------------------------------------------------------
+
+void ASplunkExporter::CollectSummary()
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    int32 Manufacturers = 0;
+    int32 Extractors = 0;
+    int32 Generators = 0;
+    int32 Producing = 0;
+    float ProductivitySum = 0.0f;
+    float PowerConsumption = 0.0f;
+
+    for (TActorIterator<AFGBuildableManufacturer> It(World); It; ++It)
+    {
+        Manufacturers++;
+        ProductivitySum += It->GetProductivity();
+        if (It->IsProducing()) { Producing++; }
+        if (UFGPowerInfoComponent* Power = It->GetPowerInfo()) { PowerConsumption += Power->GetActualConsumption(); }
+    }
+    for (TActorIterator<AFGBuildableResourceExtractor> It(World); It; ++It)
+    {
+        Extractors++;
+        ProductivitySum += It->GetProductivity();
+        if (It->IsProducing()) { Producing++; }
+        if (UFGPowerInfoComponent* Power = It->GetPowerInfo()) { PowerConsumption += Power->GetActualConsumption(); }
+    }
+    for (TActorIterator<AFGBuildableGenerator> It(World); It; ++It)
+    {
+        Generators++;
+    }
+
+    float CircuitProduced = 0.0f;
+    float CircuitConsumed = 0.0f;
+    float CircuitCapacity = 0.0f;
+    int32 Circuits = 0;
+    for (TObjectIterator<UFGPowerCircuit> It; It; ++It)
+    {
+        UFGPowerCircuit* Circuit = *It;
+        if (!IsValid(Circuit) || Circuit->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject) || Circuit->GetWorld() != World)
+        {
+            continue;
+        }
+        FPowerCircuitStats Stats;
+        Circuit->GetStats(Stats);
+        CircuitProduced += Stats.PowerProduced;
+        CircuitConsumed += Stats.PowerConsumed;
+        CircuitCapacity += Stats.PowerProductionCapacity;
+        Circuits++;
+    }
+
+    int32 Players = 0;
+    for (TActorIterator<AFGCharacterPlayer> It(World); It; ++It) { Players++; }
+
+    int32 Trucks = 0;
+    for (TActorIterator<AFGWheeledVehicle> It(World); It; ++It) { Trucks++; }
+
+    int32 Trains = 0;
+    if (AFGRailroadSubsystem* Railroad = AFGRailroadSubsystem::Get(World))
+    {
+        TArray<AFGTrain*> AllTrains;
+        Railroad->GetAllTrains(AllTrains);
+        Trains = AllTrains.Num();
+    }
+
+    const int32 Machines = Manufacturers + Extractors;
+
+    TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:summary"));
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetNumberField(TEXT("manufacturers"), Manufacturers);
+    Data->SetNumberField(TEXT("extractors"), Extractors);
+    Data->SetNumberField(TEXT("generators"), Generators);
+    Data->SetNumberField(TEXT("machines_producing"), Producing);
+    Data->SetNumberField(TEXT("avg_productivity"), Machines > 0 ? ProductivitySum / Machines : 0.0f);
+    Data->SetNumberField(TEXT("power_circuits"), Circuits);
+    Data->SetNumberField(TEXT("power_produced_mw"), CircuitProduced);
+    Data->SetNumberField(TEXT("power_consumed_mw"), CircuitConsumed);
+    Data->SetNumberField(TEXT("power_capacity_mw"), CircuitCapacity);
+    Data->SetNumberField(TEXT("factory_power_consumption_mw"), PowerConsumption);
+    Data->SetNumberField(TEXT("players"), Players);
+    Data->SetNumberField(TEXT("trucks"), Trucks);
+    Data->SetNumberField(TEXT("trains"), Trains);
+    Event->SetObjectField(TEXT("event"), Data);
+    AddEventToBuffer(Event);
+}
+
+void ASplunkExporter::CollectPower()
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    for (TObjectIterator<UFGPowerCircuit> It; It; ++It)
+    {
+        UFGPowerCircuit* Circuit = *It;
+        if (!IsValid(Circuit) || Circuit->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject) || Circuit->GetWorld() != World)
+        {
+            continue;
+        }
+
+        FPowerCircuitStats Stats;
+        Circuit->GetStats(Stats);
+
+        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:power"));
+        TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+        Data->SetNumberField(TEXT("circuit_id"), Circuit->GetCircuitID());
+        Data->SetNumberField(TEXT("produced_mw"), Stats.PowerProduced);
+        Data->SetNumberField(TEXT("consumed_mw"), Stats.PowerConsumed);
+        Data->SetNumberField(TEXT("capacity_mw"), Stats.PowerProductionCapacity);
+        Data->SetNumberField(TEXT("battery_input_mw"), Stats.BatteryPowerInput);
+        Data->SetBoolField(TEXT("fuse_triggered"), Circuit->IsFuseTriggered());
+        Event->SetObjectField(TEXT("event"), Data);
+        AddEventToBuffer(Event);
+    }
+}
+
+void ASplunkExporter::CollectProduction()
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    // Manufacturers: recipe, throughput, and what (if anything) they wait on.
+    for (TActorIterator<AFGBuildableManufacturer> It(World); It; ++It)
+    {
+        AFGBuildableManufacturer* Machine = *It;
+
+        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:production"));
+        TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+
+        Data->SetStringField(TEXT("machine_class"), TEXT("manufacturer"));
+        Data->SetStringField(TEXT("machine_type"), Machine->GetClass()->GetName());
+        Data->SetStringField(TEXT("machine_id"), Machine->GetName());
+        SetLocationFields(Data, Machine->GetActorLocation());
+
+        const bool bProducing = Machine->IsProducing();
+        const bool bPaused = Machine->IsProductionPaused();
+        const bool bHasPower = Machine->HasPower();
+        const float Productivity = Machine->GetProductivity();
+        const float Potential = Machine->GetCurrentPotential();
+
+        Data->SetBoolField(TEXT("is_producing"), bProducing);
+        Data->SetBoolField(TEXT("is_paused"), bPaused);
+        Data->SetBoolField(TEXT("has_power"), bHasPower);
+        Data->SetNumberField(TEXT("productivity"), Productivity);
+        Data->SetNumberField(TEXT("clock_speed"), Potential);
+        if (UFGPowerInfoComponent* Power = Machine->GetPowerInfo())
+        {
+            Data->SetNumberField(TEXT("power_consumption_mw"), Power->GetActualConsumption());
+        }
+
+        FString Status = TEXT("idle");
+        TArray<TSharedPtr<FJsonValue>> WaitingFor;
+
+        TSubclassOf<UFGRecipe> Recipe = Machine->GetCurrentRecipe();
+        if (!Recipe)
+        {
+            Status = TEXT("no_recipe");
+        }
+        else
+        {
+            Data->SetStringField(TEXT("recipe"), UFGRecipe::GetRecipeName(Recipe).ToString());
+
+            // Effective cycle time at the current clock speed.
+            const float Duration = UFGRecipe::GetManufacturingDuration(Recipe);
+            const float Speed = Machine->GetManufacturingSpeed() * Potential;
+            const float CycleTime = (Speed > 0.0f) ? Duration / Speed : 0.0f;
+            const float CyclesPerMin = (CycleTime > 0.0f) ? 60.0f / CycleTime : 0.0f;
+            Data->SetNumberField(TEXT("cycle_time_s"), CycleTime);
+
+            // Outputs: theoretical rate at this clock, actual = theoretical * productivity.
+            TArray<TSharedPtr<FJsonValue>> Outputs;
+            for (const FItemAmount& Product : UFGRecipe::GetProducts(Recipe))
+            {
+                TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
+                Out->SetStringField(TEXT("item"), ItemName(Product.ItemClass));
+                Out->SetNumberField(TEXT("per_min_at_clock"), Product.Amount * CyclesPerMin);
+                Out->SetNumberField(TEXT("per_min_actual"), Product.Amount * CyclesPerMin * Productivity);
+                Outputs.Add(MakeShared<FJsonValueObject>(Out));
+            }
+            Data->SetArrayField(TEXT("outputs"), Outputs);
+
+            // Inputs: required rate plus how much is buffered in the input inventory.
+            UFGInventoryComponent* InputInv = Machine->GetInputInventory();
+            TArray<TSharedPtr<FJsonValue>> Inputs;
+            bool bInputStarved = false;
+            for (const FItemAmount& Ingredient : UFGRecipe::GetIngredients(this, Recipe))
+            {
+                const int32 Buffered = (InputInv && Ingredient.ItemClass)
+                    ? InputInv->GetNumItems(Ingredient.ItemClass) : 0;
+
+                TSharedPtr<FJsonObject> In = MakeShared<FJsonObject>();
+                In->SetStringField(TEXT("item"), ItemName(Ingredient.ItemClass));
+                In->SetNumberField(TEXT("per_min_at_clock"), Ingredient.Amount * CyclesPerMin);
+                In->SetNumberField(TEXT("buffered"), Buffered);
+                Inputs.Add(MakeShared<FJsonValueObject>(In));
+
+                if (Buffered < Ingredient.Amount)
+                {
+                    bInputStarved = true;
+                    WaitingFor.Add(MakeShared<FJsonValueString>(ItemName(Ingredient.ItemClass)));
+                }
+            }
+            Data->SetArrayField(TEXT("inputs"), Inputs);
+
+            if (bPaused)              { Status = TEXT("paused"); }
+            else if (!bHasPower)      { Status = TEXT("no_power"); }
+            else if (bProducing)      { Status = TEXT("producing"); }
+            else if (bInputStarved)   { Status = TEXT("waiting_for_input"); }
+            else                      { Status = TEXT("output_backed_up"); }
+        }
+
+        Data->SetStringField(TEXT("status"), Status);
+        if (WaitingFor.Num() > 0)
+        {
+            Data->SetArrayField(TEXT("waiting_for"), WaitingFor);
+        }
+
+        Event->SetObjectField(TEXT("event"), Data);
+        AddEventToBuffer(Event);
+    }
+
+    // Resource extractors (miners, oil extractors, water pumps, ...).
+    for (TActorIterator<AFGBuildableResourceExtractor> It(World); It; ++It)
+    {
+        AFGBuildableResourceExtractor* Extractor = *It;
+
+        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:production"));
+        TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+
+        Data->SetStringField(TEXT("machine_class"), TEXT("extractor"));
+        Data->SetStringField(TEXT("machine_type"), Extractor->GetClass()->GetName());
+        Data->SetStringField(TEXT("machine_id"), Extractor->GetName());
+        SetLocationFields(Data, Extractor->GetActorLocation());
+
+        const bool bProducing = Extractor->IsProducing();
+        const bool bHasPower = Extractor->HasPower();
+        Data->SetBoolField(TEXT("is_producing"), bProducing);
+        Data->SetBoolField(TEXT("is_paused"), Extractor->IsProductionPaused());
+        Data->SetBoolField(TEXT("has_power"), bHasPower);
+        Data->SetNumberField(TEXT("productivity"), Extractor->GetProductivity());
+        Data->SetNumberField(TEXT("clock_speed"), Extractor->GetCurrentPotential());
+        Data->SetNumberField(TEXT("per_min_at_clock"), Extractor->GetExtractionPerMinute());
+        if (UFGPowerInfoComponent* Power = Extractor->GetPowerInfo())
+        {
+            Data->SetNumberField(TEXT("power_consumption_mw"), Power->GetActualConsumption());
+        }
+
+        TScriptInterface<IFGExtractableResourceInterface> Resource = Extractor->GetExtractableResource();
+        if (Resource.GetInterface())
+        {
+            Data->SetStringField(TEXT("resource"), ItemName(Resource->GetResourceClass()));
+        }
+
+        FString Status;
+        if (Extractor->IsProductionPaused()) { Status = TEXT("paused"); }
+        else if (!bHasPower)                 { Status = TEXT("no_power"); }
+        else if (bProducing)                 { Status = TEXT("producing"); }
+        else                                 { Status = TEXT("output_backed_up"); }
+        Data->SetStringField(TEXT("status"), Status);
+
+        Event->SetObjectField(TEXT("event"), Data);
+        AddEventToBuffer(Event);
+    }
+
+    // Generators: capacity, fuel state.
+    for (TActorIterator<AFGBuildableGenerator> It(World); It; ++It)
+    {
+        AFGBuildableGenerator* Generator = *It;
+
+        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:production"));
+        TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+
+        Data->SetStringField(TEXT("machine_class"), TEXT("generator"));
+        Data->SetStringField(TEXT("machine_type"), Generator->GetClass()->GetName());
+        Data->SetStringField(TEXT("machine_id"), Generator->GetName());
+        SetLocationFields(Data, Generator->GetActorLocation());
+        Data->SetBoolField(TEXT("is_producing"), Generator->IsProducing());
+        Data->SetNumberField(TEXT("capacity_mw"), Generator->GetPowerProductionCapacity());
+        Data->SetNumberField(TEXT("clock_speed"), Generator->GetCurrentPotential());
+
+        FString Status = Generator->IsProducing() ? TEXT("producing") : TEXT("idle");
+        if (AFGBuildableGeneratorFuel* FuelGenerator = Cast<AFGBuildableGeneratorFuel>(Generator))
+        {
+            const bool bHasFuel = FuelGenerator->HasFuel();
+            Data->SetBoolField(TEXT("has_fuel"), bHasFuel);
+            Data->SetNumberField(TEXT("fuel_amount"), FuelGenerator->GetFuelAmount());
+            if (!bHasFuel)
+            {
+                Status = TEXT("waiting_for_fuel");
+            }
+        }
+        Data->SetStringField(TEXT("status"), Status);
+
+        Event->SetObjectField(TEXT("event"), Data);
+        AddEventToBuffer(Event);
+    }
+}
+
+void ASplunkExporter::CollectInventory()
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    // Total of every item type sitting in storage containers.
+    TMap<FString, int64> Totals;
+    int32 Containers = 0;
+
+    for (TActorIterator<AFGBuildableStorage> It(World); It; ++It)
+    {
+        UFGInventoryComponent* Inventory = It->GetStorageInventory();
+        if (!Inventory) continue;
+        Containers++;
+
+        for (int32 Index = 0; Index < Inventory->GetSizeLinear(); ++Index)
+        {
+            FInventoryStack Stack;
+            if (Inventory->GetStackFromIndex(Index, Stack) && Stack.HasItems())
+            {
+                Totals.FindOrAdd(ItemName(Stack.Item.GetItemClass())) += Stack.NumItems;
+            }
+        }
+    }
+
+    for (const TPair<FString, int64>& Pair : Totals)
+    {
+        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:inventory"));
+        TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+        Data->SetStringField(TEXT("item"), Pair.Key);
+        Data->SetNumberField(TEXT("count"), static_cast<double>(Pair.Value));
+        Data->SetNumberField(TEXT("containers_scanned"), Containers);
+        Event->SetObjectField(TEXT("event"), Data);
+        AddEventToBuffer(Event);
+    }
+}
+
+void ASplunkExporter::CollectVehicles()
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    // Wheeled vehicles (trucks, tractors, explorers, factory carts).
+    for (TActorIterator<AFGWheeledVehicle> It(World); It; ++It)
+    {
+        AFGWheeledVehicle* Vehicle = *It;
+
+        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:vehicle"));
+        TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+
+        Data->SetStringField(TEXT("vehicle_class"), TEXT("wheeled"));
+        Data->SetStringField(TEXT("vehicle_type"), Vehicle->GetClass()->GetName());
+        Data->SetStringField(TEXT("vehicle_id"), Vehicle->GetName());
+        SetLocationFields(Data, Vehicle->GetActorLocation());
+        Data->SetNumberField(TEXT("speed_kmh"), Vehicle->GetVelocity().Size() * SpeedToKmh);
+        Data->SetBoolField(TEXT("has_fuel"), Vehicle->HasFuel());
+
+        if (UFGInventoryComponent* Cargo = Vehicle->GetStorageInventory())
+        {
+            int32 SlotsUsed = 0;
+            int64 ItemCount = 0;
+            TArray<TSharedPtr<FJsonValue>> CargoArray;
+            for (int32 Index = 0; Index < Cargo->GetSizeLinear(); ++Index)
+            {
+                FInventoryStack Stack;
+                if (Cargo->GetStackFromIndex(Index, Stack) && Stack.HasItems())
+                {
+                    SlotsUsed++;
+                    ItemCount += Stack.NumItems;
+                    TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+                    Item->SetStringField(TEXT("item"), ItemName(Stack.Item.GetItemClass()));
+                    Item->SetNumberField(TEXT("count"), Stack.NumItems);
+                    CargoArray.Add(MakeShared<FJsonValueObject>(Item));
+                }
+            }
+            Data->SetArrayField(TEXT("cargo"), CargoArray);
+            Data->SetNumberField(TEXT("cargo_slots_used"), SlotsUsed);
+            Data->SetNumberField(TEXT("cargo_slots_total"), Cargo->GetSizeLinear());
+            Data->SetNumberField(TEXT("cargo_items"), static_cast<double>(ItemCount));
+        }
+
+        Event->SetObjectField(TEXT("event"), Data);
+        AddEventToBuffer(Event);
+    }
+
+    // Trains.
+    if (AFGRailroadSubsystem* Railroad = AFGRailroadSubsystem::Get(World))
+    {
+        TArray<AFGTrain*> Trains;
+        Railroad->GetAllTrains(Trains);
+
+        for (AFGTrain* Train : Trains)
+        {
+            if (!IsValid(Train)) continue;
+
+            TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:vehicle"));
+            TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+
+            Data->SetStringField(TEXT("vehicle_class"), TEXT("train"));
+            Data->SetStringField(TEXT("vehicle_id"), Train->GetName());
+            Data->SetStringField(TEXT("train_name"), Train->GetTrainName().ToString());
+            Data->SetBoolField(TEXT("self_driving"), Train->IsSelfDrivingEnabled());
+
+            if (AFGRailroadVehicle* FirstVehicle = Train->GetFirstVehicle())
+            {
+                SetLocationFields(Data, FirstVehicle->GetActorLocation());
+                Data->SetNumberField(TEXT("speed_kmh"), FirstVehicle->GetVelocity().Size() * SpeedToKmh);
+            }
+
+            if (AFGRailroadTimeTable* TimeTable = Train->GetTimeTable())
+            {
+                TArray<FTimeTableStop> Stops;
+                TimeTable->GetStops(Stops);
+                Data->SetNumberField(TEXT("timetable_stops"), Stops.Num());
+
+                const int32 CurrentStop = TimeTable->GetCurrentStop();
+                Data->SetNumberField(TEXT("current_stop_index"), CurrentStop);
+                if (Stops.IsValidIndex(CurrentStop) && Stops[CurrentStop].Station)
+                {
+                    Data->SetStringField(TEXT("next_station"), Stops[CurrentStop].Station->GetStationName().ToString());
+                }
+            }
+
+            Event->SetObjectField(TEXT("event"), Data);
+            AddEventToBuffer(Event);
+        }
+    }
+
+    // Freight wagon cargo - what each train is actually hauling.
+    for (TActorIterator<AFGFreightWagon> It(World); It; ++It)
+    {
+        AFGFreightWagon* Wagon = *It;
+        UFGInventoryComponent* Freight = Wagon->GetFreightInventory();
+        if (!Freight) continue;
+
+        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:vehicle"));
+        TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+
+        Data->SetStringField(TEXT("vehicle_class"), TEXT("freight_wagon"));
+        Data->SetStringField(TEXT("vehicle_id"), Wagon->GetName());
+        if (AFGTrain* Train = Wagon->GetTrain())
+        {
+            Data->SetStringField(TEXT("train_name"), Train->GetTrainName().ToString());
+        }
+        SetLocationFields(Data, Wagon->GetActorLocation());
+
+        int32 SlotsUsed = 0;
+        TArray<TSharedPtr<FJsonValue>> CargoArray;
+        for (int32 Index = 0; Index < Freight->GetSizeLinear(); ++Index)
+        {
+            FInventoryStack Stack;
+            if (Freight->GetStackFromIndex(Index, Stack) && Stack.HasItems())
+            {
+                SlotsUsed++;
+                TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+                Item->SetStringField(TEXT("item"), ItemName(Stack.Item.GetItemClass()));
+                Item->SetNumberField(TEXT("count"), Stack.NumItems);
+                CargoArray.Add(MakeShared<FJsonValueObject>(Item));
+            }
+        }
+        Data->SetArrayField(TEXT("cargo"), CargoArray);
+        Data->SetNumberField(TEXT("cargo_slots_used"), SlotsUsed);
+        Data->SetNumberField(TEXT("cargo_slots_total"), Freight->GetSizeLinear());
+
+        Event->SetObjectField(TEXT("event"), Data);
+        AddEventToBuffer(Event);
+    }
+}
+
+void ASplunkExporter::CollectPlayers()
+{
+    UWorld* World = GetWorld();
+    if (!World) return;
+
+    for (TActorIterator<AFGCharacterPlayer> It(World); It; ++It)
+    {
+        AFGCharacterPlayer* Player = *It;
+
+        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:player"));
+        TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+
+        FString PlayerName = Player->GetName();
+        if (APlayerState* State = Player->GetPlayerState())
+        {
+            PlayerName = State->GetPlayerName();
+        }
+        Data->SetStringField(TEXT("player"), PlayerName);
+        SetLocationFields(Data, Player->GetActorLocation());
+        Data->SetNumberField(TEXT("speed_kmh"), Player->GetVelocity().Size() * SpeedToKmh);
+        Data->SetBoolField(TEXT("in_vehicle"), Player->IsDrivingVehicle());
+
+        Event->SetObjectField(TEXT("event"), Data);
+        AddEventToBuffer(Event);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------
+
+void ASplunkExporter::FlushBuffer()
 {
     if (DataBuffer.Num() == 0)
     {
         return;
     }
 
-    // Splunk HEC batch format: one JSON object per line (NOT wrapped in an array)
-    FString BatchString;
-    for (auto& Event : DataBuffer)
+    // Splunk HEC batch format: concatenated JSON objects, one per event.
+    FString Payload;
+    for (const TSharedPtr<FJsonObject>& Event : DataBuffer)
     {
         FString EventString;
-        TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&EventString);
+        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&EventString);
         FJsonSerializer::Serialize(Event.ToSharedRef(), Writer);
-        BatchString += EventString + TEXT("\n");
+        Payload += EventString;
+        Payload += TEXT("\n");
     }
 
-    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: Sending batch of %d events to Splunk"), DataBuffer.Num());
-
-    SendDataToSplunk(BatchString);
+    const int32 Count = DataBuffer.Num();
     DataBuffer.Empty();
-    EventsInBuffer = 0;
+    SendToSplunk(Payload, Count);
 }
 
-TSharedPtr<FJsonObject> ASplunkExporter::CreateBaseEvent(const FString& SourceType)
+void ASplunkExporter::SendToSplunk(const FString& Payload, int32 EventCount)
 {
-    TSharedPtr<FJsonObject> EventObject = MakeShareable(new FJsonObject);
-    
-    EventObject->SetStringField(TEXT("time"), FString::Printf(TEXT("%.0f"), FDateTime::Now().ToUnixTimestamp()));
-    EventObject->SetStringField(TEXT("host"), TEXT("satisfactory-game"));
-    EventObject->SetStringField(TEXT("sourcetype"), SourceType);
-    
-    return EventObject;
-}
-
-void ASplunkExporter::AddEventToBuffer(TSharedPtr<FJsonObject> EventObject)
-{
-    if (EventObject.IsValid())
+    if (!IsConfigured())
     {
-        DataBuffer.Add(EventObject);
-    }
-}
-
-void ASplunkExporter::CollectProductionData()
-{
-    UWorld* World = GetWorld();
-    if (!World) return;
-
-    // Collect manufacturer data
-    for (TActorIterator<AFGBuildableManufacturer> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        AFGBuildableManufacturer* Manufacturer = *ActorItr;
-        if (!Manufacturer || !Manufacturer->IsValidLowLevel()) continue;
-
-        TSharedPtr<FJsonObject> EventObject = CreateBaseEvent(TEXT("satisfactory:production"));
-        TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
-        
-        // Machine data
-        EventData->SetStringField(TEXT("machine_type"), TEXT("Manufacturer"));
-        EventData->SetStringField(TEXT("machine_id"), Manufacturer->GetName());
-        EventData->SetNumberField(TEXT("power_consumption"), Manufacturer->GetPowerConsumption());
-        EventData->SetNumberField(TEXT("efficiency"), Manufacturer->GetProductionEfficiency());
-        
-        // Recipe information
-        TSubclassOf<class UFGRecipe> CurrentRecipe = Manufacturer->GetCurrentRecipe();
-        if (CurrentRecipe)
-        {
-            UFGRecipe* Recipe = CurrentRecipe->GetDefaultObject<UFGRecipe>();
-            if (Recipe)
-            {
-                EventData->SetStringField(TEXT("recipe_name"), Recipe->GetDisplayName().ToString());
-
-                TArray<FItemAmount> Products = Recipe->GetProducts();
-                TArray<FItemAmount> Ingredients = Recipe->GetIngredients();
-
-                if (Products.Num() > 0 && Products[0].ItemClass)
-                {
-                    UFGItemDescriptor* ProductDesc = Products[0].ItemClass->GetDefaultObject<UFGItemDescriptor>();
-                    if (ProductDesc)
-                    {
-                        EventData->SetStringField(TEXT("output_item"), ProductDesc->GetDisplayName().ToString());
-                        EventData->SetNumberField(TEXT("output_rate"), Products[0].Amount);
-                    }
-                }
-
-                if (Ingredients.Num() > 0 && Ingredients[0].ItemClass)
-                {
-                    UFGItemDescriptor* IngredientDesc = Ingredients[0].ItemClass->GetDefaultObject<UFGItemDescriptor>();
-                    if (IngredientDesc)
-                    {
-                        EventData->SetStringField(TEXT("input_item"), IngredientDesc->GetDisplayName().ToString());
-                        EventData->SetNumberField(TEXT("input_rate"), Ingredients[0].Amount);
-                    }
-                }
-                
-                // Handle multi-input recipes
-                if (Ingredients.Num() > 1)
-                {
-                    TArray<TSharedPtr<FJsonValue>> SecondaryInputs;
-                    for (int32 i = 1; i < Ingredients.Num(); i++)
-                    {
-                        if (Ingredients[i].ItemClass)
-                        {
-                            UFGItemDescriptor* IngredientDesc = Ingredients[i].ItemClass->GetDefaultObject<UFGItemDescriptor>();
-                            if (IngredientDesc)
-                            {
-                                TSharedPtr<FJsonObject> InputObj = MakeShareable(new FJsonObject);
-                                InputObj->SetStringField(TEXT("item"), IngredientDesc->GetDisplayName().ToString());
-                                InputObj->SetNumberField(TEXT("rate"), Ingredients[i].Amount);
-                                SecondaryInputs.Add(MakeShareable(new FJsonValueObject(InputObj)));
-                            }
-                        }
-                    }
-                    if (SecondaryInputs.Num() > 0)
-                    {
-                        EventData->SetArrayField(TEXT("secondary_inputs"), SecondaryInputs);
-                    }
-                }
-            }
-        }
-        
-        // Location data
-        FVector Location = Manufacturer->GetActorLocation();
-        EventData->SetNumberField(TEXT("location_x"), Location.X);
-        EventData->SetNumberField(TEXT("location_y"), Location.Y);
-        EventData->SetNumberField(TEXT("location_z"), Location.Z);
-        
-        EventObject->SetObjectField(TEXT("event"), EventData);
-        AddEventToBuffer(EventObject);
-    }
-    
-    // Collect resource extractor data
-    for (TActorIterator<AFGBuildableResourceExtractor> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        AFGBuildableResourceExtractor* Extractor = *ActorItr;
-        if (!Extractor || !Extractor->IsValidLowLevel()) continue;
-
-        TSharedPtr<FJsonObject> EventObject = CreateBaseEvent(TEXT("satisfactory:extraction"));
-        TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
-        
-        EventData->SetStringField(TEXT("machine_type"), TEXT("Extractor"));
-        EventData->SetStringField(TEXT("machine_id"), Extractor->GetName());
-        EventData->SetNumberField(TEXT("power_consumption"), Extractor->GetPowerConsumption());
-        EventData->SetNumberField(TEXT("efficiency"), Extractor->GetProductionEfficiency());
-        EventData->SetNumberField(TEXT("extraction_rate"), Extractor->GetExtractionRate());
-        
-        // Resource type
-        TSubclassOf<UFGResourceDescriptor> ResourceClass = Extractor->GetResourceClass();
-        if (ResourceClass)
-        {
-            UFGResourceDescriptor* ResourceDesc = ResourceClass->GetDefaultObject<UFGResourceDescriptor>();
-            if (ResourceDesc)
-            {
-                EventData->SetStringField(TEXT("resource_type"), ResourceDesc->GetDisplayName().ToString());
-            }
-        }
-        
-        FVector Location = Extractor->GetActorLocation();
-        EventData->SetNumberField(TEXT("location_x"), Location.X);
-        EventData->SetNumberField(TEXT("location_y"), Location.Y);
-        EventData->SetNumberField(TEXT("location_z"), Location.Z);
-        
-        EventObject->SetObjectField(TEXT("event"), EventData);
-        AddEventToBuffer(EventObject);
-    }
-}
-
-void ASplunkExporter::CollectPowerData()
-{
-    UWorld* World = GetWorld();
-    if (!World) return;
-
-    // Get power subsystem
-    AFGBuildableSubsystem* BuildableSubsystem = AFGBuildableSubsystem::Get(World);
-    if (!BuildableSubsystem) return;
-
-    // Collect power generator data
-    for (TActorIterator<AFGBuildablePowerGenerator> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        AFGBuildablePowerGenerator* Generator = *ActorItr;
-        if (!Generator || !Generator->IsValidLowLevel()) continue;
-
-        TSharedPtr<FJsonObject> EventObject = CreateBaseEvent(TEXT("satisfactory:power:generator"));
-        TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
-        
-        EventData->SetStringField(TEXT("generator_type"), Generator->GetClass()->GetName());
-        EventData->SetStringField(TEXT("generator_id"), Generator->GetName());
-        EventData->SetNumberField(TEXT("power_production"), Generator->GetPowerProduction());
-        EventData->SetNumberField(TEXT("max_power_production"), Generator->GetMaxPowerProduction());
-        EventData->SetNumberField(TEXT("efficiency"), Generator->GetProductionEfficiency());
-        EventData->SetBoolField(TEXT("is_producing"), Generator->IsProducing());
-        
-        // Location
-        FVector Location = Generator->GetActorLocation();
-        EventData->SetNumberField(TEXT("location_x"), Location.X);
-        EventData->SetNumberField(TEXT("location_y"), Location.Y);
-        EventData->SetNumberField(TEXT("location_z"), Location.Z);
-        
-        // Fuel data for fuel-powered generators
-        if (AFGBuildablePowerGeneratorFuel* FuelGenerator = Cast<AFGBuildablePowerGeneratorFuel>(Generator))
-        {
-            UFGInventoryComponent* FuelInventory = FuelGenerator->GetFuelInventory();
-            if (FuelInventory)
-            {
-                float TotalFuelEnergy = 0.0f;
-                int32 FuelStacks = 0;
-                
-                for (int32 i = 0; i < FuelInventory->GetSizeLinear(); i++)
-                {
-                    FInventoryStack Stack;
-                    if (FuelInventory->GetStackFromIndex(i, Stack) && !Stack.Item.ItemClass.IsNull())
-                    {
-                        FuelStacks++;
-                        UFGItemDescriptor* ItemDesc = Stack.Item.ItemClass->GetDefaultObject<UFGItemDescriptor>();
-                        
-                        // Get energy value based on fuel type
-                        float EnergyValue = 100.0f; // Default
-                        if (UFGItemDescriptorNuclearFuel* NuclearFuel = Cast<UFGItemDescriptorNuclearFuel>(ItemDesc))
-                        {
-                            EnergyValue = NuclearFuel->GetEnergyValue();
-                        }
-                        else if (UFGItemDescriptorBiomass* BiomassFuel = Cast<UFGItemDescriptorBiomass>(ItemDesc))
-                        {
-                            EnergyValue = BiomassFuel->GetEnergyValue();
-                        }
-                        
-                        TotalFuelEnergy += EnergyValue * Stack.NumItems;
-                    }
-                }
-                
-                EventData->SetNumberField(TEXT("fuel_energy_available"), TotalFuelEnergy);
-                EventData->SetNumberField(TEXT("fuel_stacks"), FuelStacks);
-            }
-        }
-        
-        EventObject->SetObjectField(TEXT("event"), EventData);
-        AddEventToBuffer(EventObject);
-    }
-
-    // TODO: Implement power circuit collection
-    // Power circuits need to be retrieved from the power subsystem
-    // Current API for accessing power circuits is unclear and needs investigation
-}
-
-void ASplunkExporter::CollectAllVehicleData()
-{
-    CollectPersonalVehicles();
-    CollectTrainData();
-}
-
-FString ASplunkExporter::GetVehicleTypeFromClass(const FString& ClassName)
-{
-    if (ClassName.Contains(TEXT("Tractor")))
-    {
-        return TEXT("Tractor");
-    }
-    else if (ClassName.Contains(TEXT("Explorer")))
-    {
-        return TEXT("Explorer");
-    }
-    else if (ClassName.Contains(TEXT("CyberWagon")))
-    {
-        return TEXT("CyberWagon");
-    }
-    else if (ClassName.Contains(TEXT("Cart")))
-    {
-        return TEXT("FactoryCart");
-    }
-    else if (ClassName.Contains(TEXT("Truck")))
-    {
-        return TEXT("Truck");
-    }
-    
-    return TEXT("Unknown");
-}
-
-void ASplunkExporter::CollectPersonalVehicles()
-{
-    UWorld* World = GetWorld();
-    if (!World) return;
-
-    for (TActorIterator<AFGWheeledVehicle> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        AFGWheeledVehicle* Vehicle = *ActorItr;
-        if (!Vehicle || !Vehicle->IsValidLowLevel()) continue;
-
-        bool bIsPlayerDriven = Vehicle->IsPlayerDriven();
-        bool bIsAutomated = Vehicle->IsAutoPilotEnabled();
-        
-        TSharedPtr<FJsonObject> EventObject;
-        if (bIsAutomated)
-        {
-            EventObject = CreateBaseEvent(TEXT("satisfactory:vehicle:automated"));
-        }
-        else
-        {
-            EventObject = CreateBaseEvent(TEXT("satisfactory:vehicle:personal"));
-        }
-        
-        TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
-        
-        FString VehicleClass = Vehicle->GetClass()->GetName();
-        FString VehicleType = GetVehicleTypeFromClass(VehicleClass);
-        
-        EventData->SetStringField(TEXT("vehicle_type"), VehicleType);
-        EventData->SetStringField(TEXT("vehicle_id"), Vehicle->GetName());
-        EventData->SetBoolField(TEXT("is_player_driven"), bIsPlayerDriven);
-        EventData->SetBoolField(TEXT("is_automated"), bIsAutomated);
-        
-        // Position and movement
-        FVector Location = Vehicle->GetActorLocation();
-        FVector Velocity = Vehicle->GetVelocity();
-        FRotator Rotation = Vehicle->GetActorRotation();
-        
-        EventData->SetNumberField(TEXT("location_x"), Location.X);
-        EventData->SetNumberField(TEXT("location_y"), Location.Y);
-        EventData->SetNumberField(TEXT("location_z"), Location.Z);
-        EventData->SetNumberField(TEXT("speed"), Velocity.Size());
-        EventData->SetNumberField(TEXT("heading"), Rotation.Yaw);
-        EventData->SetNumberField(TEXT("pitch"), Rotation.Pitch);
-        EventData->SetNumberField(TEXT("roll"), Rotation.Roll);
-        
-        // Player information if player-driven
-        if (bIsPlayerDriven)
-        {
-            APawn* Driver = Vehicle->GetInstigator();
-            if (Driver)
-            {
-                EventData->SetStringField(TEXT("driver_name"), Driver->GetName());
-                
-                APlayerController* PC = Cast<APlayerController>(Driver->GetController());
-                if (PC)
-                {
-                    EventData->SetStringField(TEXT("player_id"), PC->GetName());
-                }
-            }
-        }
-        
-        // Fuel system
-        UFGInventoryComponent* FuelInventory = Vehicle->GetFuelInventory();
-        if (FuelInventory)
-        {
-            TArray<TSharedPtr<FJsonValue>> FuelArray;
-            float TotalFuelEnergy = 0.0f;
-            float MaxFuelEnergy = 0.0f;
-            
-            for (int32 i = 0; i < FuelInventory->GetSizeLinear(); i++)
-            {
-                FInventoryStack Stack;
-                if (FuelInventory->GetStackFromIndex(i, Stack) && !Stack.Item.ItemClass.IsNull())
-                {
-                    TSharedPtr<FJsonObject> FuelItem = MakeShareable(new FJsonObject);
-                    UFGItemDescriptor* ItemDesc = Stack.Item.ItemClass->GetDefaultObject<UFGItemDescriptor>();
-                    
-                    FuelItem->SetStringField(TEXT("fuel_type"), ItemDesc->GetDisplayName().ToString());
-                    FuelItem->SetNumberField(TEXT("quantity"), Stack.NumItems);
-                    
-                    // Calculate energy value
-                    float EnergyValue = 100.0f; // Default energy value
-                    UFGItemDescriptorNuclearFuel* NuclearFuel = Cast<UFGItemDescriptorNuclearFuel>(ItemDesc);
-                    UFGItemDescriptorBiomass* BiomassFuel = Cast<UFGItemDescriptorBiomass>(ItemDesc);
-                    
-                    if (NuclearFuel)
-                    {
-                        EnergyValue = NuclearFuel->GetEnergyValue();
-                    }
-                    else if (BiomassFuel)
-                    {
-                        EnergyValue = BiomassFuel->GetEnergyValue();
-                    }
-                    
-                    TotalFuelEnergy += EnergyValue * Stack.NumItems;
-                    FuelItem->SetNumberField(TEXT("energy_value"), EnergyValue);
-                    
-                    FuelArray.Add(MakeShareable(new FJsonValueObject(FuelItem)));
-                }
-                
-                MaxFuelEnergy += 100.0f; // Approximate max energy per slot
-            }
-            
-            EventData->SetArrayField(TEXT("fuel_items"), FuelArray);
-            EventData->SetNumberField(TEXT("fuel_energy_current"), TotalFuelEnergy);
-            EventData->SetNumberField(TEXT("fuel_energy_max"), MaxFuelEnergy);
-            EventData->SetNumberField(TEXT("fuel_percentage"), MaxFuelEnergy > 0 ? TotalFuelEnergy / MaxFuelEnergy : 0.0f);
-        }
-        
-        // Inventory/Storage
-        UFGInventoryComponent* Inventory = Vehicle->GetStorageInventory();
-        if (Inventory)
-        {
-            TArray<TSharedPtr<FJsonValue>> CargoArray;
-            int32 SlotsUsed = 0;
-            int32 TotalSlots = Inventory->GetSizeLinear();
-            float TotalWeight = 0.0f;
-            
-            for (int32 i = 0; i < TotalSlots; i++)
-            {
-                FInventoryStack Stack;
-                if (Inventory->GetStackFromIndex(i, Stack) && !Stack.Item.ItemClass.IsNull())
-                {
-                    SlotsUsed++;
-                    
-                    TSharedPtr<FJsonObject> CargoItem = MakeShareable(new FJsonObject);
-                    UFGItemDescriptor* ItemDesc = Stack.Item.ItemClass->GetDefaultObject<UFGItemDescriptor>();
-                    
-                    CargoItem->SetStringField(TEXT("item_name"), ItemDesc->GetDisplayName().ToString());
-                    CargoItem->SetNumberField(TEXT("quantity"), Stack.NumItems);
-                    
-                    float ItemWeight = ItemDesc->GetWeight() * Stack.NumItems;
-                    CargoItem->SetNumberField(TEXT("weight"), ItemWeight);
-                    TotalWeight += ItemWeight;
-                    
-                    CargoArray.Add(MakeShareable(new FJsonValueObject(CargoItem)));
-                }
-            }
-            
-            EventData->SetArrayField(TEXT("cargo"), CargoArray);
-            EventData->SetNumberField(TEXT("cargo_slots_used"), SlotsUsed);
-            EventData->SetNumberField(TEXT("cargo_slots_total"), TotalSlots);
-            EventData->SetNumberField(TEXT("cargo_utilization"), TotalSlots > 0 ? (float)SlotsUsed / TotalSlots : 0.0f);
-            EventData->SetNumberField(TEXT("cargo_weight"), TotalWeight);
-        }
-        
-        // Vehicle-specific data
-        if (VehicleType == TEXT("CyberWagon"))
-        {
-            EventData->SetStringField(TEXT("power_type"), TEXT("Electric"));
-        }
-        else
-        {
-            EventData->SetStringField(TEXT("power_type"), TEXT("Fuel"));
-        }
-        
-        EventData->SetNumberField(TEXT("max_speed"), Vehicle->GetMaxSpeed());
-        
-        // Autopilot data for automated vehicles
-        if (bIsAutomated)
-        {
-            AFGBuildableDockingStation* TargetStation = Vehicle->GetTargetNodeLinkedDockingStation();
-            if (TargetStation)
-            {
-                EventData->SetStringField(TEXT("target_station"), TargetStation->GetName());
-                
-                FVector TargetLocation = TargetStation->GetActorLocation();
-                float DistanceToTarget = FVector::Dist(Location, TargetLocation);
-                EventData->SetNumberField(TEXT("distance_to_target"), DistanceToTarget);
-            }
-        }
-        
-        EventObject->SetObjectField(TEXT("event"), EventData);
-        AddEventToBuffer(EventObject);
-    }
-}
-
-void ASplunkExporter::CollectTrainData()
-{
-    UWorld* World = GetWorld();
-    if (!World) return;
-
-    for (TActorIterator<AFGTrain> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        AFGTrain* Train = *ActorItr;
-        if (!Train || !Train->IsValidLowLevel()) continue;
-
-        TSharedPtr<FJsonObject> EventObject = CreateBaseEvent(TEXT("satisfactory:vehicle:train"));
-        TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
-        
-        EventData->SetStringField(TEXT("vehicle_type"), TEXT("Train"));
-        EventData->SetStringField(TEXT("train_id"), Train->GetName());
-        EventData->SetNumberField(TEXT("speed"), Train->GetVelocity().Size());
-        EventData->SetBoolField(TEXT("is_player_driven"), Train->IsPlayerDriven());
-        
-        // Get all rolling stock
-        TArray<AFGRailroadVehicle*> RollingStock = Train->GetConsist();
-        EventData->SetNumberField(TEXT("car_count"), RollingStock.Num());
-        
-        TArray<TSharedPtr<FJsonValue>> CarsArray;
-        float TotalPowerConsumption = 0.0f;
-        
-        for (int32 i = 0; i < RollingStock.Num(); i++)
-        {
-            AFGRailroadVehicle* Car = RollingStock[i];
-            if (!Car) continue;
-            
-            TSharedPtr<FJsonObject> CarData = MakeShareable(new FJsonObject);
-            
-            FVector CarLocation = Car->GetActorLocation();
-            CarData->SetNumberField(TEXT("car_index"), i);
-            CarData->SetStringField(TEXT("car_id"), Car->GetName());
-            CarData->SetNumberField(TEXT("location_x"), CarLocation.X);
-            CarData->SetNumberField(TEXT("location_y"), CarLocation.Y);
-            CarData->SetNumberField(TEXT("location_z"), CarLocation.Z);
-            
-            // Check if it's a locomotive
-            AFGLocomotive* Locomotive = Cast<AFGLocomotive>(Car);
-            if (Locomotive)
-            {
-                CarData->SetStringField(TEXT("car_type"), TEXT("Locomotive"));
-                CarData->SetNumberField(TEXT("power_consumption"), Locomotive->GetPowerConsumption());
-                TotalPowerConsumption += Locomotive->GetPowerConsumption();
-                
-                // Fuel status
-                UFGInventoryComponent* FuelInventory = Locomotive->GetFuelInventory();
-                if (FuelInventory)
-                {
-                    int32 FuelStacks = 0;
-                    int32 MaxFuelStacks = FuelInventory->GetSizeLinear();
-                    
-                    for (int32 j = 0; j < MaxFuelStacks; j++)
-                    {
-                        FInventoryStack Stack;
-                        if (FuelInventory->GetStackFromIndex(j, Stack) && !Stack.Item.ItemClass.IsNull())
-                        {
-                            FuelStacks++;
-                        }
-                    }
-                    
-                    float FuelPercentage = MaxFuelStacks > 0 ? (float)FuelStacks / MaxFuelStacks : 0.0f;
-                    CarData->SetNumberField(TEXT("fuel_percentage"), FuelPercentage);
-                }
-            }
-            else
-            {
-                // Freight car
-                AFGFreightWagon* FreightCar = Cast<AFGFreightWagon>(Car);
-                if (FreightCar)
-                {
-                    CarData->SetStringField(TEXT("car_type"), TEXT("Freight"));
-                    
-                    UFGInventoryComponent* CargoInventory = FreightCar->GetStorageInventory();
-                    if (CargoInventory)
-                    {
-                        TArray<TSharedPtr<FJsonValue>> CargoArray;
-                        int32 SlotsUsed = 0;
-                        int32 TotalSlots = CargoInventory->GetSizeLinear();
-                        
-                        for (int32 j = 0; j < TotalSlots; j++)
-                        {
-                            FInventoryStack Stack;
-                            if (CargoInventory->GetStackFromIndex(j, Stack) && !Stack.Item.ItemClass.IsNull())
-                            {
-                                SlotsUsed++;
-                                
-                                TSharedPtr<FJsonObject> CargoItem = MakeShareable(new FJsonObject);
-                                UFGItemDescriptor* ItemDesc = Stack.Item.ItemClass->GetDefaultObject<UFGItemDescriptor>();
-                                CargoItem->SetStringField(TEXT("item_name"), ItemDesc->GetDisplayName().ToString());
-                                CargoItem->SetNumberField(TEXT("quantity"), Stack.NumItems);
-                                
-                                CargoArray.Add(MakeShareable(new FJsonValueObject(CargoItem)));
-                            }
-                        }
-                        
-                        CarData->SetArrayField(TEXT("cargo"), CargoArray);
-                        CarData->SetNumberField(TEXT("cargo_utilization"), TotalSlots > 0 ? (float)SlotsUsed / TotalSlots : 0.0f);
-                    }
-                }
-            }
-            
-            CarsArray.Add(MakeShareable(new FJsonValueObject(CarData)));
-        }
-        
-        EventData->SetArrayField(TEXT("cars"), CarsArray);
-        EventData->SetNumberField(TEXT("total_power_consumption"), TotalPowerConsumption);
-        
-        // Timetable information
-        AFGRailroadTimeTable* TimeTable = Train->GetTimeTable();
-        if (TimeTable)
-        {
-            TArray<AFGTrainStationIdentifier*> Stations = TimeTable->GetStations();
-            EventData->SetNumberField(TEXT("timetable_stations"), Stations.Num());
-            
-            int32 CurrentStop = TimeTable->GetCurrentStop();
-            EventData->SetNumberField(TEXT("current_stop_index"), CurrentStop);
-            
-            if (CurrentStop >= 0 && CurrentStop < Stations.Num())
-            {
-                AFGTrainStationIdentifier* CurrentStation = Stations[CurrentStop];
-                if (CurrentStation)
-                {
-                    EventData->SetStringField(TEXT("current_station"), CurrentStation->GetStationName().ToString());
-                }
-            }
-        }
-        
-        EventObject->SetObjectField(TEXT("event"), EventData);
-        AddEventToBuffer(EventObject);
-    }
-}
-
-void ASplunkExporter::CollectPlayerMovementSystems()
-{
-    UWorld* World = GetWorld();
-    if (!World) return;
-
-    for (TActorIterator<AFGCharacterPlayer> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        AFGCharacterPlayer* Player = *ActorItr;
-        if (!Player || !Player->IsValidLowLevel()) continue;
-
-        TSharedPtr<FJsonObject> EventObject = CreateBaseEvent(TEXT("satisfactory:player:movement"));
-        TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
-        
-        EventData->SetStringField(TEXT("player_name"), Player->GetName());
-        
-        // Position
-        FVector Location = Player->GetActorLocation();
-        FVector Velocity = Player->GetVelocity();
-        
-        EventData->SetNumberField(TEXT("location_x"), Location.X);
-        EventData->SetNumberField(TEXT("location_y"), Location.Y);
-        EventData->SetNumberField(TEXT("location_z"), Location.Z);
-        EventData->SetNumberField(TEXT("speed"), Velocity.Size());
-        
-        // Movement state
-        UCharacterMovementComponent* Movement = Player->GetCharacterMovement();
-        if (Movement)
-        {
-            bool bIsFlying = Movement->IsFlying();
-            bool bIsFalling = Movement->IsFalling();
-            bool bIsWalking = Movement->IsWalking();
-            
-            EventData->SetBoolField(TEXT("is_flying"), bIsFlying);
-            EventData->SetBoolField(TEXT("is_falling"), bIsFalling);
-            EventData->SetBoolField(TEXT("is_walking"), bIsWalking);
-        }
-        
-        // Jetpack status
-        UFGJetPack* JetPack = Player->GetJetPack();
-        if (JetPack)
-        {
-            EventData->SetBoolField(TEXT("has_jetpack"), true);
-            EventData->SetBoolField(TEXT("jetpack_active"), JetPack->IsActive());
-            EventData->SetNumberField(TEXT("jetpack_fuel"), JetPack->GetCurrentFuel());
-            EventData->SetNumberField(TEXT("jetpack_fuel_max"), JetPack->GetMaxFuel());
-        }
-        else
-        {
-            EventData->SetBoolField(TEXT("has_jetpack"), false);
-        }
-        
-        // Check if in vehicle
-        APawn* VehiclePawn = Player->GetVehicle();
-        if (VehiclePawn)
-        {
-            EventData->SetBoolField(TEXT("in_vehicle"), true);
-            EventData->SetStringField(TEXT("vehicle_name"), VehiclePawn->GetName());
-        }
-        else
-        {
-            EventData->SetBoolField(TEXT("in_vehicle"), false);
-        }
-        
-        EventObject->SetObjectField(TEXT("event"), EventData);
-        AddEventToBuffer(EventObject);
-    }
-}
-
-void ASplunkExporter::CollectFactoryLayoutData()
-{
-    UWorld* World = GetWorld();
-    if (!World) return;
-
-    TSharedPtr<FJsonObject> LayoutEvent = CreateBaseEvent(TEXT("satisfactory:factory:layout"));
-    TSharedPtr<FJsonObject> EventData = MakeShareable(new FJsonObject);
-
-    EventData->SetStringField(TEXT("event_type"), TEXT("factory_layout"));
-
-    TArray<TSharedPtr<FJsonValue>> BuildingsArray;
-
-    for (TActorIterator<AFGBuildable> ActorItr(World); ActorItr; ++ActorItr)
-    {
-        AFGBuildable* Building = *ActorItr;
-        if (!Building) continue;
-
-        TSharedPtr<FJsonObject> BuildingData = MakeShareable(new FJsonObject);
-        BuildingData->SetStringField(TEXT("building_type"), Building->GetClass()->GetName());
-        BuildingData->SetStringField(TEXT("building_id"), Building->GetName());
-
-        FVector Location = Building->GetActorLocation();
-        BuildingData->SetNumberField(TEXT("x"), Location.X);
-        BuildingData->SetNumberField(TEXT("y"), Location.Y);
-        BuildingData->SetNumberField(TEXT("z"), Location.Z);
-
-        FRotator Rotation = Building->GetActorRotation();
-        BuildingData->SetNumberField(TEXT("rotation"), Rotation.Yaw);
-
-        BuildingsArray.Add(MakeShareable(new FJsonValueObject(BuildingData)));
-    }
-
-    EventData->SetArrayField(TEXT("buildings"), BuildingsArray);
-    LayoutEvent->SetObjectField(TEXT("event"), EventData);
-
-    SendLayoutDataToSplunk(LayoutEvent);
-}
-
-// ===== METRICS MODE - PER-TYPE COLLECTORS =====
-
-TSharedPtr<FJsonObject> ASplunkExporter::CreateMetricsEvent()
-{
-    TSharedPtr<FJsonObject> Event = MakeShareable(new FJsonObject);
-    Event->SetStringField(TEXT("time"), FString::Printf(TEXT("%.0f"), FDateTime::Now().ToUnixTimestamp()));
-    Event->SetStringField(TEXT("event"), TEXT("metric"));
-    Event->SetStringField(TEXT("source"), TEXT("satisfactory-mod"));
-    Event->SetStringField(TEXT("sourcetype"), TEXT("satisfactory:metrics"));
-    return Event;
-}
-
-void ASplunkExporter::CollectPowerMetrics()
-{
-    UWorld* World = GetWorld();
-    if (!World) return;
-
-    float TotalConsumption = 0.0f;
-    float TotalProduction = 0.0f;
-    int32 GeneratorCount = 0;
-
-    for (TActorIterator<AFGBuildablePowerGenerator> It(World); It; ++It)
-        if (It->IsValidLowLevel()) { GeneratorCount++; TotalProduction += It->GetPowerProduction(); }
-
-    for (TActorIterator<AFGBuildableManufacturer> It(World); It; ++It)
-        if (It->IsValidLowLevel()) TotalConsumption += It->GetPowerConsumption();
-
-    for (TActorIterator<AFGBuildableResourceExtractor> It(World); It; ++It)
-        if (It->IsValidLowLevel()) TotalConsumption += It->GetPowerConsumption();
-
-    TSharedPtr<FJsonObject> Event = CreateMetricsEvent();
-    TSharedPtr<FJsonObject> Fields = MakeShareable(new FJsonObject);
-    Fields->SetNumberField(TEXT("metric_name:factory.power.consumption"), TotalConsumption);
-    Fields->SetNumberField(TEXT("metric_name:factory.power.production"), TotalProduction);
-    Fields->SetNumberField(TEXT("metric_name:factory.power.net"),        TotalProduction - TotalConsumption);
-    Fields->SetNumberField(TEXT("metric_name:factory.machines.generators"), GeneratorCount);
-    Event->SetObjectField(TEXT("fields"), Fields);
-    AddEventToBuffer(Event);
-    EventsInBuffer = DataBuffer.Num();
-}
-
-void ASplunkExporter::CollectProductionMetrics()
-{
-    UWorld* World = GetWorld();
-    if (!World) return;
-
-    int32 ManufacturerCount = 0;
-    int32 ExtractorCount = 0;
-    float TotalEfficiency = 0.0f;
-    int32 ProducingCount = 0;
-
-    for (TActorIterator<AFGBuildableManufacturer> It(World); It; ++It)
-    {
-        if (!It->IsValidLowLevel()) continue;
-        ManufacturerCount++;
-        float Eff = It->GetProductionEfficiency();
-        if (Eff > 0.0f) { TotalEfficiency += Eff; ProducingCount++; }
-    }
-    for (TActorIterator<AFGBuildableResourceExtractor> It(World); It; ++It)
-    {
-        if (!It->IsValidLowLevel()) continue;
-        ExtractorCount++;
-        float Eff = It->GetProductionEfficiency();
-        if (Eff > 0.0f) { TotalEfficiency += Eff; ProducingCount++; }
-    }
-
-    TSharedPtr<FJsonObject> Event = CreateMetricsEvent();
-    TSharedPtr<FJsonObject> Fields = MakeShareable(new FJsonObject);
-    Fields->SetNumberField(TEXT("metric_name:factory.machines.manufacturers"), ManufacturerCount);
-    Fields->SetNumberField(TEXT("metric_name:factory.machines.extractors"),   ExtractorCount);
-    Fields->SetNumberField(TEXT("metric_name:factory.efficiency.average"),    ProducingCount > 0 ? TotalEfficiency / ProducingCount : 0.0f);
-    Event->SetObjectField(TEXT("fields"), Fields);
-    AddEventToBuffer(Event);
-    EventsInBuffer = DataBuffer.Num();
-}
-
-void ASplunkExporter::CollectVehicleMetrics()
-{
-    UWorld* World = GetWorld();
-    if (!World) return;
-
-    int32 WheeledCount = 0;
-    int32 TrainCount = 0;
-    for (TActorIterator<AFGWheeledVehicle> It(World); It; ++It) if (It->IsValidLowLevel()) WheeledCount++;
-    for (TActorIterator<AFGTrain>          It(World); It; ++It) if (It->IsValidLowLevel()) TrainCount++;
-
-    TSharedPtr<FJsonObject> Event = CreateMetricsEvent();
-    TSharedPtr<FJsonObject> Fields = MakeShareable(new FJsonObject);
-    Fields->SetNumberField(TEXT("metric_name:factory.vehicles.wheeled"), WheeledCount);
-    Fields->SetNumberField(TEXT("metric_name:factory.vehicles.trains"),  TrainCount);
-    Event->SetObjectField(TEXT("fields"), Fields);
-    AddEventToBuffer(Event);
-    EventsInBuffer = DataBuffer.Num();
-}
-
-void ASplunkExporter::CollectPlayerMetrics()
-{
-    UWorld* World = GetWorld();
-    if (!World) return;
-
-    int32 PlayerCount = 0;
-    for (TActorIterator<AFGCharacterPlayer> It(World); It; ++It) if (It->IsValidLowLevel()) PlayerCount++;
-
-    TSharedPtr<FJsonObject> Event = CreateMetricsEvent();
-    TSharedPtr<FJsonObject> Fields = MakeShareable(new FJsonObject);
-    Fields->SetNumberField(TEXT("metric_name:factory.players"), PlayerCount);
-    Event->SetObjectField(TEXT("fields"), Fields);
-    AddEventToBuffer(Event);
-    EventsInBuffer = DataBuffer.Num();
-}
-
-void ASplunkExporter::CheckAndFlushBuffer()
-{
-    // Always flush on timer regardless of buffer size
-    if (DataBuffer.Num() > 0)
-    {
-        SendBufferedData();
-    }
-}
-
-void ASplunkExporter::SendDataToSplunk(const FString& JsonData)
-{
-    if (SplunkURL.IsEmpty() || HECToken.IsEmpty())
-    {
-        UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkExporter: Splunk URL or HEC Token not configured"));
         return;
     }
 
     FHttpRequestRef Request = FHttpModule::Get().CreateRequest();
     Request->OnProcessRequestComplete().BindUObject(this, &ASplunkExporter::OnHttpResponse);
-    
     Request->SetURL(SplunkURL);
-    Request->SetVerb("POST");
-    Request->SetHeader("User-Agent", "SatisfactoryMod/1.0");
-    Request->SetHeader("Content-Type", "application/json");
-    Request->SetHeader("Authorization", FString::Printf(TEXT("Splunk %s"), *HECToken));
-    Request->SetContentAsString(JsonData);
-    
+    Request->SetVerb(TEXT("POST"));
+    Request->SetTimeout(15.0f);
+    Request->SetHeader(TEXT("User-Agent"), TEXT("SatisfactorySplunkMod/2.0"));
+    Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+    Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Splunk %s"), *HECToken));
+    Request->SetContentAsString(Payload);
     Request->ProcessRequest();
-}
 
-void ASplunkExporter::SendLayoutDataToSplunk(TSharedPtr<FJsonObject> LayoutData)
-{
-    if (!LayoutData.IsValid()) return;
-    
-    FString OutputString;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
-    FJsonSerializer::Serialize(LayoutData.ToSharedRef(), Writer);
-    
-    SendDataToSplunk(OutputString);
+    EventsSentTotal += EventCount;
 }
 
 void ASplunkExporter::OnHttpResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful)
@@ -1042,34 +796,35 @@ void ASplunkExporter::OnHttpResponse(FHttpRequestPtr Request, FHttpResponsePtr R
     if (!bWasSuccessful || !Response.IsValid())
     {
         UE_LOG(LogSatisfactorySplunkMod, Error,
-            TEXT("SplunkExporter: Network error - could not reach Splunk at %s"), *SplunkURL);
+            TEXT("SplunkExporter: network error - could not reach %s. ")
+            TEXT("If Splunk uses a self-signed HTTPS certificate the game will reject it; ")
+            TEXT("either serve HEC over plain http:// or install a trusted certificate."),
+            *SplunkURL);
         return;
     }
 
-    int32 ResponseCode = Response->GetResponseCode();
-
-    if (ResponseCode >= 200 && ResponseCode < 300)
+    const int32 Code = Response->GetResponseCode();
+    if (Code >= 200 && Code < 300)
     {
-        LastSuccessfulSend = FDateTime::Now();
-        LastBufferFlush    = FDateTime::Now();
-        EventsSentTotal++;
-        UE_LOG(LogSatisfactorySplunkMod, Log,
-            TEXT("SplunkExporter: Data sent successfully (HTTP %d). Total sends: %d"),
-            ResponseCode, EventsSentTotal);
+        BatchesSent++;
+        if (BatchesSent == 1 || BatchesSent % 100 == 0)
+        {
+            UE_LOG(LogSatisfactorySplunkMod, Log,
+                TEXT("SplunkExporter: HTTP %d - %d batches / %d events sent (%d dropped)"),
+                Code, BatchesSent, EventsSentTotal, EventsDropped);
+        }
         return;
     }
 
-    // Specific HEC error messages to help with troubleshooting
     FString Reason;
-    switch (ResponseCode)
+    switch (Code)
     {
-        case 400: Reason = TEXT("Bad request - check JSON payload format");            break;
-        case 401: Reason = TEXT("Unauthorized - HECToken is invalid or missing");     break;
-        case 403: Reason = TEXT("Forbidden - HEC input may be disabled in Splunk");   break;
-        case 404: Reason = TEXT("Not found - check SplunkURL path (/services/collector)"); break;
-        case 503: Reason = TEXT("Splunk is busy or unavailable - will retry on next cycle"); break;
-        default:  Reason = Response->GetContentAsString();                              break;
+        case 400: Reason = TEXT("bad request - malformed payload");                              break;
+        case 401:
+        case 403: Reason = TEXT("auth failed - check HECToken and that the token is enabled");   break;
+        case 404: Reason = TEXT("not found - URL should end in /services/collector/event");      break;
+        case 503: Reason = TEXT("Splunk busy/unavailable");                                      break;
+        default:  Reason = Response->GetContentAsString().Left(200);                             break;
     }
-    UE_LOG(LogSatisfactorySplunkMod, Error,
-        TEXT("SplunkExporter: HTTP %d - %s"), ResponseCode, *Reason);
+    UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkExporter: HTTP %d - %s"), Code, *Reason);
 }
