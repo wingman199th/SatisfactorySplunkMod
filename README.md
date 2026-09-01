@@ -56,6 +56,9 @@ guide at **https://docs.ficsit.app/satisfactory-modding/latest/Development/Begin
    `SatisfactorySplunkMod`, and click *Alpakit!* to package and copy it into
    your game's `FactoryGame/Mods/` folder (or package a zip for SMM).
 
+Once built, see **[INSTALL.md](INSTALL.md)** for getting the packaged mod
+into the game (including dedicated servers) and verifying it end to end.
+
 ## Splunk setup
 
 1. In Splunk: **Settings → Data Inputs → HTTP Event Collector → New Token**.
