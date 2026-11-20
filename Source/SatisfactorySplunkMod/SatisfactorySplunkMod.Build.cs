@@ -4,7 +4,11 @@ public class SatisfactorySplunkMod : ModuleRules
 {
     public SatisfactorySplunkMod(ReadOnlyTargetRules Target) : base(Target)
     {
-        PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+        // Match the settings SML itself builds with.
+        CppStandard = CppStandardVersion.Cpp20;
+        DefaultBuildSettings = BuildSettingsVersion.Latest;
+        PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+        bLegacyPublicIncludePaths = false;
 
         PublicDependencyModuleNames.AddRange(new string[]
         {

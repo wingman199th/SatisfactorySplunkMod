@@ -4,26 +4,27 @@
 #include "EngineUtils.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
-#include "UObject/UObjectIterator.h"
 #include "GameFramework/PlayerState.h"
 
 #include "HttpModule.h"
-#include "Interfaces/IHttpResponse.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
 
-#include "Misc/ConfigCacheIni.h"
+#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
-#include "Interfaces/IPluginManager.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformMisc.h"
+#include "Interfaces/IPluginManager.h"
 
 // FactoryGame
+#include "Buildables/FGBuildableFactory.h"
 #include "Buildables/FGBuildableManufacturer.h"
 #include "Buildables/FGBuildableResourceExtractor.h"
 #include "Buildables/FGBuildableGenerator.h"
 #include "Buildables/FGBuildableGeneratorFuel.h"
+#include "Buildables/FGBuildablePowerStorage.h"
 #include "Buildables/FGBuildableStorage.h"
 #include "FGPowerCircuit.h"
 #include "FGPowerInfoComponent.h"
@@ -43,12 +44,53 @@
 
 namespace
 {
+    const TCHAR* ModVersion = TEXT("2.1.0");
+    const TCHAR* ConfigFileName = TEXT("SatisfactorySplunkMod.ini");
+
     // cm/s -> km/h
     constexpr float SpeedToKmh = 0.036f;
+
+    // Max events per HTTP request, keeps payloads well under HEC limits.
+    constexpr int32 MaxEventsPerRequest = 500;
+
+    // Written to FactoryGame/Configs/ on first run if no config exists yet.
+    const TCHAR* DefaultConfigTemplate =
+        TEXT("; Satisfactory Splunk Exporter configuration\n")
+        TEXT("; Edit the two values below, then restart the game.\n")
+        TEXT("; Full option list: see README.md in the mod's repository.\n")
+        TEXT("\n")
+        TEXT("[Splunk]\n")
+        TEXT("SplunkURL=http://your-splunk-server:8088/services/collector/event\n")
+        TEXT("HECToken=your-hec-token-here\n")
+        TEXT("Index=\n")
+        TEXT("\n")
+        TEXT("[Collection]\n")
+        TEXT("SummaryInterval=5\n")
+        TEXT("PowerInterval=5\n")
+        TEXT("ProductionInterval=30\n")
+        TEXT("InventoryInterval=30\n")
+        TEXT("VehicleInterval=10\n")
+        TEXT("PlayerInterval=10\n")
+        TEXT("FlushInterval=5\n")
+        TEXT("bCollectSummary=True\n")
+        TEXT("bCollectPower=True\n")
+        TEXT("bCollectProduction=True\n")
+        TEXT("bCollectInventory=True\n")
+        TEXT("bCollectVehicles=True\n")
+        TEXT("bCollectPlayers=True\n")
+        TEXT("MaxBufferedEvents=50000\n");
 
     FString ItemName(TSubclassOf<UFGItemDescriptor> ItemClass)
     {
         return ItemClass ? UFGItemDescriptor::GetItemName(ItemClass).ToString() : TEXT("Unknown");
+    }
+
+    // Fluids are stored internally in liters; the game UI shows m^3.
+    float UnitDivisor(TSubclassOf<UFGItemDescriptor> ItemClass)
+    {
+        if (!ItemClass) return 1.0f;
+        const EResourceForm Form = UFGItemDescriptor::GetForm(ItemClass);
+        return (Form == EResourceForm::RF_LIQUID || Form == EResourceForm::RF_GAS) ? 1000.0f : 1.0f;
     }
 
     void SetLocationFields(const TSharedPtr<FJsonObject>& Obj, const FVector& Location)
@@ -56,6 +98,59 @@ namespace
         Obj->SetNumberField(TEXT("x"), Location.X);
         Obj->SetNumberField(TEXT("y"), Location.Y);
         Obj->SetNumberField(TEXT("z"), Location.Z);
+    }
+
+    TArray<TSharedPtr<FJsonValue>> InventoryToJson(UFGInventoryComponent* Inventory, int32& OutSlotsUsed)
+    {
+        OutSlotsUsed = 0;
+        TArray<TSharedPtr<FJsonValue>> Result;
+        if (!Inventory) return Result;
+
+        for (int32 Index = 0; Index < Inventory->GetSizeLinear(); ++Index)
+        {
+            FInventoryStack Stack;
+            if (Inventory->GetStackFromIndex(Index, Stack) && Stack.HasItems())
+            {
+                OutSlotsUsed++;
+                TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+                Item->SetStringField(TEXT("item"), ItemName(Stack.Item.GetItemClass()));
+                Item->SetNumberField(TEXT("count"), Stack.NumItems / UnitDivisor(Stack.Item.GetItemClass()));
+                Result.Add(MakeShared<FJsonValueObject>(Item));
+            }
+        }
+        return Result;
+    }
+
+    struct FCircuitInfo
+    {
+        int32 Buildings = 0;
+        int32 Batteries = 0;
+        float BatteryStoredMWh = 0.0f;
+        float BatteryCapacityMWh = 0.0f;
+    };
+
+    // Power circuits aren't publicly enumerable from the circuit subsystem, so
+    // gather them from the power connections of every factory building. This
+    // also skips stale circuits left over (until GC) after networks merge.
+    void GatherCircuits(UWorld* World, TMap<UFGPowerCircuit*, FCircuitInfo>& Out)
+    {
+        for (TActorIterator<AFGBuildableFactory> It(World); It; ++It)
+        {
+            UFGPowerInfoComponent* PowerInfo = It->GetPowerInfo();
+            if (!PowerInfo) continue;
+
+            UFGPowerCircuit* Circuit = PowerInfo->GetPowerCircuit();
+            if (!IsValid(Circuit)) continue;
+
+            FCircuitInfo& Info = Out.FindOrAdd(Circuit);
+            Info.Buildings++;
+            if (AFGBuildablePowerStorage* Battery = Cast<AFGBuildablePowerStorage>(*It))
+            {
+                Info.Batteries++;
+                Info.BatteryStoredMWh += Battery->GetPowerStore();
+                Info.BatteryCapacityMWh += Battery->GetPowerStoreCapacity();
+            }
+        }
     }
 }
 
@@ -67,20 +162,23 @@ ASplunkExporter::ASplunkExporter()
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle / configuration
+// Lifecycle
 // ---------------------------------------------------------------------------
 
 void ASplunkExporter::BeginPlay()
 {
     Super::BeginPlay();
 
-    // Only the authority (host / dedicated server) has the full factory state.
-    if (!HasAuthority())
+    // Only the machine that owns the game state exports. Note HasAuthority()
+    // is NOT enough: a client's locally spawned actor also has authority.
+    UWorld* World = GetWorld();
+    if (!World || World->GetNetMode() == NM_Client)
     {
+        UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: running as a multiplayer client - exporting is done by the host/server, staying idle"));
         return;
     }
 
-    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: starting up"));
+    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter %s: starting up on '%s'"), ModVersion, *HostName);
     LoadSettingsFromConfig();
     StartDataCollection();
 }
@@ -92,56 +190,127 @@ void ASplunkExporter::EndPlay(const EEndPlayReason::Type EndPlayReason)
     Super::EndPlay(EndPlayReason);
 }
 
-void ASplunkExporter::LoadSettingsFromConfig()
+// ---------------------------------------------------------------------------
+// Configuration
+//
+// The first file found is used:
+//   1. FactoryGame/Configs/SatisfactorySplunkMod.ini    (user's config, survives
+//      mod updates - SMM replaces the whole mod folder on update)
+//   2. <mod folder>/Config/SatisfactorySplunkMod.ini    (shipped template)
+// then SPLUNK_HEC_URL / SPLUNK_HEC_TOKEN / SPLUNK_HEC_INDEX environment
+// variables override whatever the file said.
+//
+// If (1) doesn't exist it is created from (2), or from a built-in template.
+// A tiny parser is used instead of FConfigFile on purpose: it has no
+// dependency on engine config-system internals, which change between UE versions.
+// ---------------------------------------------------------------------------
+
+void ASplunkExporter::ApplySetting(const FString& Key, const FString& RawValue)
 {
-    FString ConfigPath;
-    TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("SatisfactorySplunkMod"));
-    if (Plugin.IsValid())
+    FString Value = RawValue;
+    if (Value.Len() >= 2 && Value.StartsWith(TEXT("\"")) && Value.EndsWith(TEXT("\"")))
     {
-        ConfigPath = Plugin->GetBaseDir() / TEXT("Config") / TEXT("SatisfactorySplunkMod.ini");
+        Value = Value.Mid(1, Value.Len() - 2);
     }
 
-    if (!ConfigPath.IsEmpty() && FPaths::FileExists(ConfigPath))
+    auto Is = [&Key](const TCHAR* Name) { return Key.Equals(Name, ESearchCase::IgnoreCase); };
+
+    if      (Is(TEXT("SplunkURL")))          { SplunkURL = Value; }
+    else if (Is(TEXT("HECToken")))           { HECToken = Value; }
+    else if (Is(TEXT("Index")))              { SplunkIndex = Value; }
+    else if (Is(TEXT("SummaryInterval")))    { SummaryInterval = FCString::Atof(*Value); }
+    else if (Is(TEXT("PowerInterval")))      { PowerInterval = FCString::Atof(*Value); }
+    else if (Is(TEXT("ProductionInterval"))) { ProductionInterval = FCString::Atof(*Value); }
+    else if (Is(TEXT("InventoryInterval")))  { InventoryInterval = FCString::Atof(*Value); }
+    else if (Is(TEXT("VehicleInterval")))    { VehicleInterval = FCString::Atof(*Value); }
+    else if (Is(TEXT("PlayerInterval")))     { PlayerInterval = FCString::Atof(*Value); }
+    else if (Is(TEXT("FlushInterval")))      { FlushInterval = FCString::Atof(*Value); }
+    else if (Is(TEXT("bCollectSummary")))    { bCollectSummary = Value.ToBool(); }
+    else if (Is(TEXT("bCollectPower")))      { bCollectPower = Value.ToBool(); }
+    else if (Is(TEXT("bCollectProduction"))) { bCollectProduction = Value.ToBool(); }
+    else if (Is(TEXT("bCollectInventory")))  { bCollectInventory = Value.ToBool(); }
+    else if (Is(TEXT("bCollectVehicles")))   { bCollectVehicles = Value.ToBool(); }
+    else if (Is(TEXT("bCollectPlayers")))    { bCollectPlayers = Value.ToBool(); }
+    else if (Is(TEXT("MaxBufferedEvents")))  { MaxBufferedEvents = FCString::Atoi(*Value); }
+    else
     {
-        FConfigFile Ini;
-        Ini.Read(ConfigPath);
+        UE_LOG(LogSatisfactorySplunkMod, Warning, TEXT("SplunkExporter: unknown config key '%s' ignored"), *Key);
+    }
+}
 
-        Ini.GetString(TEXT("Splunk"), TEXT("SplunkURL"), SplunkURL);
-        Ini.GetString(TEXT("Splunk"), TEXT("HECToken"), HECToken);
-        Ini.GetString(TEXT("Splunk"), TEXT("Index"), SplunkIndex);
+void ASplunkExporter::LoadSettingsFromConfig()
+{
+    FString ModConfigPath;
+    if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("SatisfactorySplunkMod")))
+    {
+        ModConfigPath = Plugin->GetBaseDir() / TEXT("Config") / ConfigFileName;
+    }
+    const FString UserConfigPath = FPaths::ProjectDir() / TEXT("Configs") / ConfigFileName;
 
-        Ini.GetFloat(TEXT("Collection"), TEXT("SummaryInterval"), SummaryInterval);
-        Ini.GetFloat(TEXT("Collection"), TEXT("PowerInterval"), PowerInterval);
-        Ini.GetFloat(TEXT("Collection"), TEXT("ProductionInterval"), ProductionInterval);
-        Ini.GetFloat(TEXT("Collection"), TEXT("InventoryInterval"), InventoryInterval);
-        Ini.GetFloat(TEXT("Collection"), TEXT("VehicleInterval"), VehicleInterval);
-        Ini.GetFloat(TEXT("Collection"), TEXT("PlayerInterval"), PlayerInterval);
-        Ini.GetFloat(TEXT("Collection"), TEXT("FlushInterval"), FlushInterval);
+    // First run: create the user config so there's always one obvious file to edit.
+    if (!IFileManager::Get().FileExists(*UserConfigPath))
+    {
+        FString Template;
+        if (ModConfigPath.IsEmpty() || !FFileHelper::LoadFileToString(Template, *ModConfigPath))
+        {
+            Template = DefaultConfigTemplate;
+        }
+        IFileManager::Get().MakeDirectory(*FPaths::GetPath(UserConfigPath), true);
+        if (FFileHelper::SaveStringToFile(Template, *UserConfigPath))
+        {
+            UE_LOG(LogSatisfactorySplunkMod, Warning,
+                TEXT("SplunkExporter: created config file %s - set SplunkURL and HECToken in it, then restart the game"),
+                *FPaths::ConvertRelativePathToFull(UserConfigPath));
+        }
+    }
 
-        Ini.GetBool(TEXT("Collection"), TEXT("bCollectSummary"), bCollectSummary);
-        Ini.GetBool(TEXT("Collection"), TEXT("bCollectPower"), bCollectPower);
-        Ini.GetBool(TEXT("Collection"), TEXT("bCollectProduction"), bCollectProduction);
-        Ini.GetBool(TEXT("Collection"), TEXT("bCollectInventory"), bCollectInventory);
-        Ini.GetBool(TEXT("Collection"), TEXT("bCollectVehicles"), bCollectVehicles);
-        Ini.GetBool(TEXT("Collection"), TEXT("bCollectPlayers"), bCollectPlayers);
+    auto ParseFile = [this](const FString& Path) -> bool
+    {
+        TArray<FString> Lines;
+        if (Path.IsEmpty() || !FFileHelper::LoadFileToStringArray(Lines, *Path))
+        {
+            return false;
+        }
+        for (FString Line : Lines)
+        {
+            Line.TrimStartAndEndInline();
+            if (Line.IsEmpty() || Line.StartsWith(TEXT(";")) || Line.StartsWith(TEXT("#")) || Line.StartsWith(TEXT("[")))
+            {
+                continue;
+            }
+            FString Key, Value;
+            if (Line.Split(TEXT("="), &Key, &Value))
+            {
+                ApplySetting(Key.TrimStartAndEnd(), Value.TrimStartAndEnd());
+            }
+        }
+        return true;
+    };
 
-        Ini.GetInt(TEXT("Collection"), TEXT("MaxBufferedEvents"), MaxBufferedEvents);
-
-        UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: loaded config from %s"), *ConfigPath);
+    if (ParseFile(UserConfigPath))
+    {
+        ConfigPathUsed = FPaths::ConvertRelativePathToFull(UserConfigPath);
+    }
+    else if (ParseFile(ModConfigPath))
+    {
+        ConfigPathUsed = FPaths::ConvertRelativePathToFull(ModConfigPath);
     }
     else
     {
-        UE_LOG(LogSatisfactorySplunkMod, Warning,
-            TEXT("SplunkExporter: config file not found at '%s'"), *ConfigPath);
+        UE_LOG(LogSatisfactorySplunkMod, Error,
+            TEXT("SplunkExporter: no config found. Tried '%s' and '%s'"),
+            *FPaths::ConvertRelativePathToFull(UserConfigPath), *FPaths::ConvertRelativePathToFull(ModConfigPath));
     }
 
-    // Environment variables override the ini - handy for dedicated servers.
-    const FString EnvUrl = FPlatformMisc::GetEnvironmentVariable(TEXT("SPLUNK_HEC_URL"));
+    // Environment variables override files - handy for dedicated servers.
+    const FString EnvUrl   = FPlatformMisc::GetEnvironmentVariable(TEXT("SPLUNK_HEC_URL"));
     const FString EnvToken = FPlatformMisc::GetEnvironmentVariable(TEXT("SPLUNK_HEC_TOKEN"));
+    const FString EnvIndex = FPlatformMisc::GetEnvironmentVariable(TEXT("SPLUNK_HEC_INDEX"));
     if (!EnvUrl.IsEmpty())   { SplunkURL = EnvUrl; }
     if (!EnvToken.IsEmpty()) { HECToken = EnvToken; }
+    if (!EnvIndex.IsEmpty()) { SplunkIndex = EnvIndex; }
 
-    // Clamp intervals so a bad config can't spin-loop the game thread.
+    // Clamp so a bad config can't spin-loop the game thread.
     SummaryInterval    = FMath::Max(1.0f, SummaryInterval);
     PowerInterval      = FMath::Max(1.0f, PowerInterval);
     ProductionInterval = FMath::Max(1.0f, ProductionInterval);
@@ -149,7 +318,10 @@ void ASplunkExporter::LoadSettingsFromConfig()
     VehicleInterval    = FMath::Max(1.0f, VehicleInterval);
     PlayerInterval     = FMath::Max(1.0f, PlayerInterval);
     FlushInterval      = FMath::Max(1.0f, FlushInterval);
-    MaxBufferedEvents  = FMath::Max(100, MaxBufferedEvents);
+    MaxBufferedEvents  = FMath::Max(1000, MaxBufferedEvents);
+
+    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: config '%s' -> URL '%s', token '%s...', index '%s'"),
+        *ConfigPathUsed, *SplunkURL, *HECToken.Left(4), SplunkIndex.IsEmpty() ? TEXT("(token default)") : *SplunkIndex);
 }
 
 bool ASplunkExporter::IsConfigured() const
@@ -165,9 +337,13 @@ void ASplunkExporter::StartDataCollection()
     if (!IsConfigured())
     {
         UE_LOG(LogSatisfactorySplunkMod, Error,
-            TEXT("SplunkExporter: SplunkURL / HECToken not configured. ")
-            TEXT("Edit Config/SatisfactorySplunkMod.ini in the mod folder (or set the ")
-            TEXT("SPLUNK_HEC_URL / SPLUNK_HEC_TOKEN environment variables) and restart."));
+            TEXT("SplunkExporter: NOT STARTED - SplunkURL / HECToken are still placeholders. Edit %s and restart the game."),
+            ConfigPathUsed.IsEmpty() ? TEXT("FactoryGame/Configs/SatisfactorySplunkMod.ini") : *ConfigPathUsed);
+        return;
+    }
+    if (!SplunkURL.StartsWith(TEXT("http://")) && !SplunkURL.StartsWith(TEXT("https://")))
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkExporter: NOT STARTED - SplunkURL must start with http:// or https:// (got '%s')"), *SplunkURL);
         return;
     }
 
@@ -177,19 +353,25 @@ void ASplunkExporter::StartDataCollection()
         return;
     }
 
+    // First collection shortly after load so data shows up quickly.
+    constexpr float FirstDelay = 3.0f;
     FTimerManager& TM = World->GetTimerManager();
-    if (bCollectSummary)    { TM.SetTimer(SummaryTimer,    this, &ASplunkExporter::CollectSummary,    SummaryInterval,    true); }
-    if (bCollectPower)      { TM.SetTimer(PowerTimer,      this, &ASplunkExporter::CollectPower,      PowerInterval,      true); }
-    if (bCollectProduction) { TM.SetTimer(ProductionTimer, this, &ASplunkExporter::CollectProduction, ProductionInterval, true); }
-    if (bCollectInventory)  { TM.SetTimer(InventoryTimer,  this, &ASplunkExporter::CollectInventory,  InventoryInterval,  true); }
-    if (bCollectVehicles)   { TM.SetTimer(VehicleTimer,    this, &ASplunkExporter::CollectVehicles,   VehicleInterval,    true); }
-    if (bCollectPlayers)    { TM.SetTimer(PlayerTimer,     this, &ASplunkExporter::CollectPlayers,    PlayerInterval,     true); }
+    if (bCollectSummary)    { TM.SetTimer(SummaryTimer,    this, &ASplunkExporter::CollectSummary,    SummaryInterval,    true, FirstDelay); }
+    if (bCollectPower)      { TM.SetTimer(PowerTimer,      this, &ASplunkExporter::CollectPower,      PowerInterval,      true, FirstDelay); }
+    if (bCollectProduction) { TM.SetTimer(ProductionTimer, this, &ASplunkExporter::CollectProduction, ProductionInterval, true, FirstDelay); }
+    if (bCollectInventory)  { TM.SetTimer(InventoryTimer,  this, &ASplunkExporter::CollectInventory,  InventoryInterval,  true, FirstDelay); }
+    if (bCollectVehicles)   { TM.SetTimer(VehicleTimer,    this, &ASplunkExporter::CollectVehicles,   VehicleInterval,    true, FirstDelay); }
+    if (bCollectPlayers)    { TM.SetTimer(PlayerTimer,     this, &ASplunkExporter::CollectPlayers,    PlayerInterval,     true, FirstDelay); }
     TM.SetTimer(FlushTimer, this, &ASplunkExporter::FlushBuffer, FlushInterval, true);
 
     bIsCollecting = true;
     UE_LOG(LogSatisfactorySplunkMod, Log,
         TEXT("SplunkExporter: collection started (summary %.0fs, power %.0fs, production %.0fs, inventory %.0fs, vehicles %.0fs, players %.0fs, flush %.0fs)"),
         SummaryInterval, PowerInterval, ProductionInterval, InventoryInterval, VehicleInterval, PlayerInterval, FlushInterval);
+
+    // Send one event right away so connectivity problems show up in the log immediately.
+    SendStartupEvent();
+    FlushBuffer();
 }
 
 void ASplunkExporter::StopDataCollection()
@@ -210,14 +392,14 @@ void ASplunkExporter::StopDataCollection()
     TM.ClearTimer(FlushTimer);
 
     bIsCollecting = false;
-    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: collection stopped"));
+    UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: collection stopped (%d events sent, %d dropped)"), EventsSentTotal, EventsDropped);
 }
 
 // ---------------------------------------------------------------------------
 // Event helpers
 // ---------------------------------------------------------------------------
 
-TSharedPtr<FJsonObject> ASplunkExporter::CreateEvent(const FString& SourceType) const
+TSharedPtr<FJsonObject> ASplunkExporter::NewSplunkEvent(const FString& SourceType) const
 {
     TSharedPtr<FJsonObject> Event = MakeShared<FJsonObject>();
     Event->SetNumberField(TEXT("time"), static_cast<double>(FDateTime::UtcNow().ToUnixTimestamp()));
@@ -239,11 +421,21 @@ void ASplunkExporter::AddEventToBuffer(const TSharedPtr<FJsonObject>& EventObjec
     }
     if (DataBuffer.Num() >= MaxBufferedEvents)
     {
-        // Splunk unreachable or flush interval too slow - drop oldest first.
-        DataBuffer.RemoveAt(0);
         EventsDropped++;
+        return;
     }
     DataBuffer.Add(EventObject);
+}
+
+void ASplunkExporter::SendStartupEvent()
+{
+    TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:status"));
+    TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
+    Data->SetStringField(TEXT("message"), TEXT("exporter started"));
+    Data->SetStringField(TEXT("mod_version"), ModVersion);
+    Data->SetStringField(TEXT("net_mode"), GetWorld() && GetWorld()->GetNetMode() == NM_DedicatedServer ? TEXT("dedicated_server") : TEXT("host"));
+    Event->SetObjectField(TEXT("event"), Data);
+    AddEventToBuffer(Event);
 }
 
 // ---------------------------------------------------------------------------
@@ -260,44 +452,38 @@ void ASplunkExporter::CollectSummary()
     int32 Generators = 0;
     int32 Producing = 0;
     float ProductivitySum = 0.0f;
-    float PowerConsumption = 0.0f;
 
     for (TActorIterator<AFGBuildableManufacturer> It(World); It; ++It)
     {
         Manufacturers++;
         ProductivitySum += It->GetProductivity();
         if (It->IsProducing()) { Producing++; }
-        if (UFGPowerInfoComponent* Power = It->GetPowerInfo()) { PowerConsumption += Power->GetActualConsumption(); }
     }
     for (TActorIterator<AFGBuildableResourceExtractor> It(World); It; ++It)
     {
         Extractors++;
         ProductivitySum += It->GetProductivity();
         if (It->IsProducing()) { Producing++; }
-        if (UFGPowerInfoComponent* Power = It->GetPowerInfo()) { PowerConsumption += Power->GetActualConsumption(); }
     }
     for (TActorIterator<AFGBuildableGenerator> It(World); It; ++It)
     {
         Generators++;
     }
 
-    float CircuitProduced = 0.0f;
-    float CircuitConsumed = 0.0f;
-    float CircuitCapacity = 0.0f;
-    int32 Circuits = 0;
-    for (TObjectIterator<UFGPowerCircuit> It; It; ++It)
+    TMap<UFGPowerCircuit*, FCircuitInfo> Circuits;
+    GatherCircuits(World, Circuits);
+
+    float Produced = 0.0f, Consumed = 0.0f, Capacity = 0.0f, BatteryStored = 0.0f;
+    int32 FusesTripped = 0;
+    for (const TPair<UFGPowerCircuit*, FCircuitInfo>& Pair : Circuits)
     {
-        UFGPowerCircuit* Circuit = *It;
-        if (!IsValid(Circuit) || Circuit->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject) || Circuit->GetWorld() != World)
-        {
-            continue;
-        }
         FPowerCircuitStats Stats;
-        Circuit->GetStats(Stats);
-        CircuitProduced += Stats.PowerProduced;
-        CircuitConsumed += Stats.PowerConsumed;
-        CircuitCapacity += Stats.PowerProductionCapacity;
-        Circuits++;
+        Pair.Key->GetStats(Stats);
+        Produced += Stats.PowerProduced;
+        Consumed += Stats.PowerConsumed;
+        Capacity += Stats.PowerProductionCapacity;
+        BatteryStored += Pair.Value.BatteryStoredMWh;
+        if (Pair.Key->IsFuseTriggered()) { FusesTripped++; }
     }
 
     int32 Players = 0;
@@ -316,18 +502,20 @@ void ASplunkExporter::CollectSummary()
 
     const int32 Machines = Manufacturers + Extractors;
 
-    TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:summary"));
+    TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:summary"));
     TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
     Data->SetNumberField(TEXT("manufacturers"), Manufacturers);
     Data->SetNumberField(TEXT("extractors"), Extractors);
     Data->SetNumberField(TEXT("generators"), Generators);
     Data->SetNumberField(TEXT("machines_producing"), Producing);
+    Data->SetNumberField(TEXT("machines_idle"), Machines - Producing);
     Data->SetNumberField(TEXT("avg_productivity"), Machines > 0 ? ProductivitySum / Machines : 0.0f);
-    Data->SetNumberField(TEXT("power_circuits"), Circuits);
-    Data->SetNumberField(TEXT("power_produced_mw"), CircuitProduced);
-    Data->SetNumberField(TEXT("power_consumed_mw"), CircuitConsumed);
-    Data->SetNumberField(TEXT("power_capacity_mw"), CircuitCapacity);
-    Data->SetNumberField(TEXT("factory_power_consumption_mw"), PowerConsumption);
+    Data->SetNumberField(TEXT("power_circuits"), Circuits.Num());
+    Data->SetNumberField(TEXT("power_produced_mw"), Produced);
+    Data->SetNumberField(TEXT("power_consumed_mw"), Consumed);
+    Data->SetNumberField(TEXT("power_capacity_mw"), Capacity);
+    Data->SetNumberField(TEXT("battery_stored_mwh"), BatteryStored);
+    Data->SetNumberField(TEXT("fuses_tripped"), FusesTripped);
     Data->SetNumberField(TEXT("players"), Players);
     Data->SetNumberField(TEXT("trucks"), Trucks);
     Data->SetNumberField(TEXT("trains"), Trains);
@@ -340,24 +528,27 @@ void ASplunkExporter::CollectPower()
     UWorld* World = GetWorld();
     if (!World) return;
 
-    for (TObjectIterator<UFGPowerCircuit> It; It; ++It)
-    {
-        UFGPowerCircuit* Circuit = *It;
-        if (!IsValid(Circuit) || Circuit->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject) || Circuit->GetWorld() != World)
-        {
-            continue;
-        }
+    TMap<UFGPowerCircuit*, FCircuitInfo> Circuits;
+    GatherCircuits(World, Circuits);
 
+    for (const TPair<UFGPowerCircuit*, FCircuitInfo>& Pair : Circuits)
+    {
+        UFGPowerCircuit* Circuit = Pair.Key;
         FPowerCircuitStats Stats;
         Circuit->GetStats(Stats);
 
-        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:power"));
+        TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:power"));
         TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
         Data->SetNumberField(TEXT("circuit_id"), Circuit->GetCircuitID());
+        Data->SetNumberField(TEXT("buildings"), Pair.Value.Buildings);
         Data->SetNumberField(TEXT("produced_mw"), Stats.PowerProduced);
         Data->SetNumberField(TEXT("consumed_mw"), Stats.PowerConsumed);
         Data->SetNumberField(TEXT("capacity_mw"), Stats.PowerProductionCapacity);
+        Data->SetNumberField(TEXT("headroom_mw"), Stats.PowerProductionCapacity - Stats.PowerConsumed);
         Data->SetNumberField(TEXT("battery_input_mw"), Stats.BatteryPowerInput);
+        Data->SetNumberField(TEXT("batteries"), Pair.Value.Batteries);
+        Data->SetNumberField(TEXT("battery_stored_mwh"), Pair.Value.BatteryStoredMWh);
+        Data->SetNumberField(TEXT("battery_capacity_mwh"), Pair.Value.BatteryCapacityMWh);
         Data->SetBoolField(TEXT("fuse_triggered"), Circuit->IsFuseTriggered());
         Event->SetObjectField(TEXT("event"), Data);
         AddEventToBuffer(Event);
@@ -374,7 +565,7 @@ void ASplunkExporter::CollectProduction()
     {
         AFGBuildableManufacturer* Machine = *It;
 
-        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:production"));
+        TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:production"));
         TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 
         Data->SetStringField(TEXT("machine_class"), TEXT("manufacturer"));
@@ -386,13 +577,15 @@ void ASplunkExporter::CollectProduction()
         const bool bPaused = Machine->IsProductionPaused();
         const bool bHasPower = Machine->HasPower();
         const float Productivity = Machine->GetProductivity();
-        const float Potential = Machine->GetCurrentPotential();
+        const float RawBoost = Machine->GetCurrentProductionBoost();
+        const float Boost = RawBoost > 0.0f ? RawBoost : 1.0f;
 
         Data->SetBoolField(TEXT("is_producing"), bProducing);
         Data->SetBoolField(TEXT("is_paused"), bPaused);
         Data->SetBoolField(TEXT("has_power"), bHasPower);
         Data->SetNumberField(TEXT("productivity"), Productivity);
-        Data->SetNumberField(TEXT("clock_speed"), Potential);
+        Data->SetNumberField(TEXT("clock_speed"), Machine->GetCurrentPotential());
+        Data->SetNumberField(TEXT("production_boost"), Boost);
         if (UFGPowerInfoComponent* Power = Machine->GetPowerInfo())
         {
             Data->SetNumberField(TEXT("power_consumption_mw"), Power->GetActualConsumption());
@@ -410,21 +603,26 @@ void ASplunkExporter::CollectProduction()
         {
             Data->SetStringField(TEXT("recipe"), UFGRecipe::GetRecipeName(Recipe).ToString());
 
-            // Effective cycle time at the current clock speed.
-            const float Duration = UFGRecipe::GetManufacturingDuration(Recipe);
-            const float Speed = Machine->GetManufacturingSpeed() * Potential;
-            const float CycleTime = (Speed > 0.0f) ? Duration / Speed : 0.0f;
+            // Cycle time already includes the clock speed (potential).
+            const float CycleTime = Machine->GetProductionCycleTime();
             const float CyclesPerMin = (CycleTime > 0.0f) ? 60.0f / CycleTime : 0.0f;
             Data->SetNumberField(TEXT("cycle_time_s"), CycleTime);
 
-            // Outputs: theoretical rate at this clock, actual = theoretical * productivity.
+            // Outputs: rate at this clock (incl. somersloop boost); actual = that * productivity.
+            UFGInventoryComponent* OutputInv = Machine->GetOutputInventory();
             TArray<TSharedPtr<FJsonValue>> Outputs;
             for (const FItemAmount& Product : UFGRecipe::GetProducts(Recipe))
             {
+                const float Div = UnitDivisor(Product.ItemClass);
+                const float PerMin = Product.Amount * CyclesPerMin * Boost / Div;
                 TSharedPtr<FJsonObject> Out = MakeShared<FJsonObject>();
                 Out->SetStringField(TEXT("item"), ItemName(Product.ItemClass));
-                Out->SetNumberField(TEXT("per_min_at_clock"), Product.Amount * CyclesPerMin);
-                Out->SetNumberField(TEXT("per_min_actual"), Product.Amount * CyclesPerMin * Productivity);
+                Out->SetNumberField(TEXT("per_min_at_clock"), PerMin);
+                Out->SetNumberField(TEXT("per_min_actual"), PerMin * Productivity);
+                if (OutputInv && Product.ItemClass)
+                {
+                    Out->SetNumberField(TEXT("buffered"), OutputInv->GetNumItems(Product.ItemClass) / Div);
+                }
                 Outputs.Add(MakeShared<FJsonValueObject>(Out));
             }
             Data->SetArrayField(TEXT("outputs"), Outputs);
@@ -435,15 +633,16 @@ void ASplunkExporter::CollectProduction()
             bool bInputStarved = false;
             for (const FItemAmount& Ingredient : UFGRecipe::GetIngredients(this, Recipe))
             {
-                const int32 Buffered = (InputInv && Ingredient.ItemClass)
-                    ? InputInv->GetNumItems(Ingredient.ItemClass) : 0;
+                const float Div = UnitDivisor(Ingredient.ItemClass);
+                const int32 Buffered = (InputInv && Ingredient.ItemClass) ? InputInv->GetNumItems(Ingredient.ItemClass) : 0;
 
                 TSharedPtr<FJsonObject> In = MakeShared<FJsonObject>();
                 In->SetStringField(TEXT("item"), ItemName(Ingredient.ItemClass));
-                In->SetNumberField(TEXT("per_min_at_clock"), Ingredient.Amount * CyclesPerMin);
-                In->SetNumberField(TEXT("buffered"), Buffered);
+                In->SetNumberField(TEXT("per_min_at_clock"), Ingredient.Amount * CyclesPerMin / Div);
+                In->SetNumberField(TEXT("buffered"), Buffered / Div);
                 Inputs.Add(MakeShared<FJsonValueObject>(In));
 
+                // Not enough for one more cycle (raw units on both sides).
                 if (Buffered < Ingredient.Amount)
                 {
                     bInputStarved = true;
@@ -474,7 +673,7 @@ void ASplunkExporter::CollectProduction()
     {
         AFGBuildableResourceExtractor* Extractor = *It;
 
-        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:production"));
+        TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:production"));
         TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 
         Data->SetStringField(TEXT("machine_class"), TEXT("extractor"));
@@ -483,13 +682,19 @@ void ASplunkExporter::CollectProduction()
         SetLocationFields(Data, Extractor->GetActorLocation());
 
         const bool bProducing = Extractor->IsProducing();
+        const bool bPaused = Extractor->IsProductionPaused();
         const bool bHasPower = Extractor->HasPower();
+        const float Productivity = Extractor->GetProductivity();
+        // Already in UI units (items/min, or m^3/min for fluids).
+        const float PerMin = Extractor->GetExtractionPerMinute();
+
         Data->SetBoolField(TEXT("is_producing"), bProducing);
-        Data->SetBoolField(TEXT("is_paused"), Extractor->IsProductionPaused());
+        Data->SetBoolField(TEXT("is_paused"), bPaused);
         Data->SetBoolField(TEXT("has_power"), bHasPower);
-        Data->SetNumberField(TEXT("productivity"), Extractor->GetProductivity());
+        Data->SetNumberField(TEXT("productivity"), Productivity);
         Data->SetNumberField(TEXT("clock_speed"), Extractor->GetCurrentPotential());
-        Data->SetNumberField(TEXT("per_min_at_clock"), Extractor->GetExtractionPerMinute());
+        Data->SetNumberField(TEXT("per_min_at_clock"), PerMin);
+        Data->SetNumberField(TEXT("per_min_actual"), PerMin * Productivity);
         if (UFGPowerInfoComponent* Power = Extractor->GetPowerInfo())
         {
             Data->SetNumberField(TEXT("power_consumption_mw"), Power->GetActualConsumption());
@@ -502,10 +707,10 @@ void ASplunkExporter::CollectProduction()
         }
 
         FString Status;
-        if (Extractor->IsProductionPaused()) { Status = TEXT("paused"); }
-        else if (!bHasPower)                 { Status = TEXT("no_power"); }
-        else if (bProducing)                 { Status = TEXT("producing"); }
-        else                                 { Status = TEXT("output_backed_up"); }
+        if (bPaused)         { Status = TEXT("paused"); }
+        else if (!bHasPower) { Status = TEXT("no_power"); }
+        else if (bProducing) { Status = TEXT("producing"); }
+        else                 { Status = TEXT("output_backed_up"); }
         Data->SetStringField(TEXT("status"), Status);
 
         Event->SetObjectField(TEXT("event"), Data);
@@ -517,7 +722,7 @@ void ASplunkExporter::CollectProduction()
     {
         AFGBuildableGenerator* Generator = *It;
 
-        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:production"));
+        TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:production"));
         TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 
         Data->SetStringField(TEXT("machine_class"), TEXT("generator"));
@@ -552,7 +757,8 @@ void ASplunkExporter::CollectInventory()
     if (!World) return;
 
     // Total of every item type sitting in storage containers.
-    TMap<FString, int64> Totals;
+    TMap<FString, double> Totals;
+    TMap<FString, int32> ContainersWithItem;
     int32 Containers = 0;
 
     for (TActorIterator<AFGBuildableStorage> It(World); It; ++It)
@@ -561,22 +767,30 @@ void ASplunkExporter::CollectInventory()
         if (!Inventory) continue;
         Containers++;
 
+        TSet<FString> SeenHere;
         for (int32 Index = 0; Index < Inventory->GetSizeLinear(); ++Index)
         {
             FInventoryStack Stack;
             if (Inventory->GetStackFromIndex(Index, Stack) && Stack.HasItems())
             {
-                Totals.FindOrAdd(ItemName(Stack.Item.GetItemClass())) += Stack.NumItems;
+                const FString Name = ItemName(Stack.Item.GetItemClass());
+                Totals.FindOrAdd(Name) += Stack.NumItems / UnitDivisor(Stack.Item.GetItemClass());
+                SeenHere.Add(Name);
             }
+        }
+        for (const FString& Name : SeenHere)
+        {
+            ContainersWithItem.FindOrAdd(Name)++;
         }
     }
 
-    for (const TPair<FString, int64>& Pair : Totals)
+    for (const TPair<FString, double>& Pair : Totals)
     {
-        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:inventory"));
+        TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:inventory"));
         TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
         Data->SetStringField(TEXT("item"), Pair.Key);
-        Data->SetNumberField(TEXT("count"), static_cast<double>(Pair.Value));
+        Data->SetNumberField(TEXT("count"), Pair.Value);
+        Data->SetNumberField(TEXT("containers_with_item"), ContainersWithItem.FindRef(Pair.Key));
         Data->SetNumberField(TEXT("containers_scanned"), Containers);
         Event->SetObjectField(TEXT("event"), Data);
         AddEventToBuffer(Event);
@@ -593,7 +807,7 @@ void ASplunkExporter::CollectVehicles()
     {
         AFGWheeledVehicle* Vehicle = *It;
 
-        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:vehicle"));
+        TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:vehicle"));
         TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 
         Data->SetStringField(TEXT("vehicle_class"), TEXT("wheeled"));
@@ -606,25 +820,9 @@ void ASplunkExporter::CollectVehicles()
         if (UFGInventoryComponent* Cargo = Vehicle->GetStorageInventory())
         {
             int32 SlotsUsed = 0;
-            int64 ItemCount = 0;
-            TArray<TSharedPtr<FJsonValue>> CargoArray;
-            for (int32 Index = 0; Index < Cargo->GetSizeLinear(); ++Index)
-            {
-                FInventoryStack Stack;
-                if (Cargo->GetStackFromIndex(Index, Stack) && Stack.HasItems())
-                {
-                    SlotsUsed++;
-                    ItemCount += Stack.NumItems;
-                    TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
-                    Item->SetStringField(TEXT("item"), ItemName(Stack.Item.GetItemClass()));
-                    Item->SetNumberField(TEXT("count"), Stack.NumItems);
-                    CargoArray.Add(MakeShared<FJsonValueObject>(Item));
-                }
-            }
-            Data->SetArrayField(TEXT("cargo"), CargoArray);
+            Data->SetArrayField(TEXT("cargo"), InventoryToJson(Cargo, SlotsUsed));
             Data->SetNumberField(TEXT("cargo_slots_used"), SlotsUsed);
             Data->SetNumberField(TEXT("cargo_slots_total"), Cargo->GetSizeLinear());
-            Data->SetNumberField(TEXT("cargo_items"), static_cast<double>(ItemCount));
         }
 
         Event->SetObjectField(TEXT("event"), Data);
@@ -641,7 +839,7 @@ void ASplunkExporter::CollectVehicles()
         {
             if (!IsValid(Train)) continue;
 
-            TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:vehicle"));
+            TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:vehicle"));
             TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 
             Data->SetStringField(TEXT("vehicle_class"), TEXT("train"));
@@ -681,7 +879,7 @@ void ASplunkExporter::CollectVehicles()
         UFGInventoryComponent* Freight = Wagon->GetFreightInventory();
         if (!Freight) continue;
 
-        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:vehicle"));
+        TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:vehicle"));
         TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 
         Data->SetStringField(TEXT("vehicle_class"), TEXT("freight_wagon"));
@@ -693,20 +891,7 @@ void ASplunkExporter::CollectVehicles()
         SetLocationFields(Data, Wagon->GetActorLocation());
 
         int32 SlotsUsed = 0;
-        TArray<TSharedPtr<FJsonValue>> CargoArray;
-        for (int32 Index = 0; Index < Freight->GetSizeLinear(); ++Index)
-        {
-            FInventoryStack Stack;
-            if (Freight->GetStackFromIndex(Index, Stack) && Stack.HasItems())
-            {
-                SlotsUsed++;
-                TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
-                Item->SetStringField(TEXT("item"), ItemName(Stack.Item.GetItemClass()));
-                Item->SetNumberField(TEXT("count"), Stack.NumItems);
-                CargoArray.Add(MakeShared<FJsonValueObject>(Item));
-            }
-        }
-        Data->SetArrayField(TEXT("cargo"), CargoArray);
+        Data->SetArrayField(TEXT("cargo"), InventoryToJson(Freight, SlotsUsed));
         Data->SetNumberField(TEXT("cargo_slots_used"), SlotsUsed);
         Data->SetNumberField(TEXT("cargo_slots_total"), Freight->GetSizeLinear());
 
@@ -724,15 +909,13 @@ void ASplunkExporter::CollectPlayers()
     {
         AFGCharacterPlayer* Player = *It;
 
-        TSharedPtr<FJsonObject> Event = CreateEvent(TEXT("satisfactory:player"));
+        TSharedPtr<FJsonObject> Event = NewSplunkEvent(TEXT("satisfactory:player"));
         TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
 
-        FString PlayerName = Player->GetName();
-        if (APlayerState* State = Player->GetPlayerState())
-        {
-            PlayerName = State->GetPlayerName();
-        }
-        Data->SetStringField(TEXT("player"), PlayerName);
+        // Offline players' characters stay in the world without a PlayerState.
+        APlayerState* State = Player->GetPlayerState();
+        Data->SetStringField(TEXT("player"), State ? State->GetPlayerName() : Player->GetName());
+        Data->SetBoolField(TEXT("online"), State != nullptr);
         SetLocationFields(Data, Player->GetActorLocation());
         Data->SetNumberField(TEXT("speed_kmh"), Player->GetVelocity().Size() * SpeedToKmh);
         Data->SetBoolField(TEXT("in_vehicle"), Player->IsDrivingVehicle());
@@ -748,13 +931,15 @@ void ASplunkExporter::CollectPlayers()
 
 void ASplunkExporter::FlushBuffer()
 {
-    if (DataBuffer.Num() == 0)
+    if (DataBuffer.Num() == 0 || !IsConfigured())
     {
+        DataBuffer.Reset();
         return;
     }
 
-    // Splunk HEC batch format: concatenated JSON objects, one per event.
+    // Splunk HEC batch format: concatenated JSON event objects.
     FString Payload;
+    int32 InPayload = 0;
     for (const TSharedPtr<FJsonObject>& Event : DataBuffer)
     {
         FString EventString;
@@ -763,68 +948,85 @@ void ASplunkExporter::FlushBuffer()
         FJsonSerializer::Serialize(Event.ToSharedRef(), Writer);
         Payload += EventString;
         Payload += TEXT("\n");
+
+        if (++InPayload >= MaxEventsPerRequest)
+        {
+            SendToSplunk(Payload, InPayload);
+            Payload.Reset();
+            InPayload = 0;
+        }
+    }
+    if (InPayload > 0)
+    {
+        SendToSplunk(Payload, InPayload);
     }
 
-    const int32 Count = DataBuffer.Num();
-    DataBuffer.Empty();
-    SendToSplunk(Payload, Count);
+    DataBuffer.Reset();
 }
 
 void ASplunkExporter::SendToSplunk(const FString& Payload, int32 EventCount)
 {
-    if (!IsConfigured())
-    {
-        return;
-    }
-
     FHttpRequestRef Request = FHttpModule::Get().CreateRequest();
-    Request->OnProcessRequestComplete().BindUObject(this, &ASplunkExporter::OnHttpResponse);
+    Request->OnProcessRequestComplete().BindUObject(this, &ASplunkExporter::OnHttpResponse, EventCount);
     Request->SetURL(SplunkURL);
     Request->SetVerb(TEXT("POST"));
     Request->SetTimeout(15.0f);
-    Request->SetHeader(TEXT("User-Agent"), TEXT("SatisfactorySplunkMod/2.0"));
+    Request->SetHeader(TEXT("User-Agent"), FString::Printf(TEXT("SatisfactorySplunkMod/%s"), ModVersion));
     Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
     Request->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Splunk %s"), *HECToken));
     Request->SetContentAsString(Payload);
     Request->ProcessRequest();
-
-    EventsSentTotal += EventCount;
 }
 
-void ASplunkExporter::OnHttpResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful)
+void ASplunkExporter::OnHttpResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, int32 EventCount)
 {
-    if (!bWasSuccessful || !Response.IsValid())
+    const int32 Code = (bWasSuccessful && Response.IsValid()) ? Response->GetResponseCode() : 0;
+
+    if (Code >= 200 && Code < 300)
     {
-        UE_LOG(LogSatisfactorySplunkMod, Error,
-            TEXT("SplunkExporter: network error - could not reach %s. ")
-            TEXT("If Splunk uses a self-signed HTTPS certificate the game will reject it; ")
-            TEXT("either serve HEC over plain http:// or install a trusted certificate."),
-            *SplunkURL);
+        if (ConsecutiveFailures > 0)
+        {
+            UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: connection to Splunk restored after %d failed sends"), ConsecutiveFailures);
+        }
+        ConsecutiveFailures = 0;
+        BatchesSent++;
+        EventsSentTotal += EventCount;
+        if (BatchesSent == 1 || BatchesSent % 100 == 0)
+        {
+            UE_LOG(LogSatisfactorySplunkMod, Log, TEXT("SplunkExporter: HTTP %d OK - %d batches / %d events sent (%d dropped)"),
+                Code, BatchesSent, EventsSentTotal, EventsDropped);
+        }
         return;
     }
 
-    const int32 Code = Response->GetResponseCode();
-    if (Code >= 200 && Code < 300)
+    EventsDropped += EventCount;
+    ConsecutiveFailures++;
+
+    // Log the first failure, then once a minute-ish, to avoid flooding the log.
+    if (ConsecutiveFailures != 1 && ConsecutiveFailures % 12 != 0)
     {
-        BatchesSent++;
-        if (BatchesSent == 1 || BatchesSent % 100 == 0)
-        {
-            UE_LOG(LogSatisfactorySplunkMod, Log,
-                TEXT("SplunkExporter: HTTP %d - %d batches / %d events sent (%d dropped)"),
-                Code, BatchesSent, EventsSentTotal, EventsDropped);
-        }
+        return;
+    }
+
+    if (Code == 0)
+    {
+        UE_LOG(LogSatisfactorySplunkMod, Error,
+            TEXT("SplunkExporter: network error - could not reach %s (failure #%d). Check host/port/firewall. ")
+            TEXT("If using https:// with Splunk's default self-signed certificate the game rejects it - use http:// (disable SSL on HEC) or a trusted certificate."),
+            *SplunkURL, ConsecutiveFailures);
         return;
     }
 
     FString Reason;
     switch (Code)
     {
-        case 400: Reason = TEXT("bad request - malformed payload");                              break;
+        case 400: Reason = TEXT("bad request - often an Index the token isn't allowed to write to"); break;
         case 401:
-        case 403: Reason = TEXT("auth failed - check HECToken and that the token is enabled");   break;
-        case 404: Reason = TEXT("not found - URL should end in /services/collector/event");      break;
-        case 503: Reason = TEXT("Splunk busy/unavailable");                                      break;
-        default:  Reason = Response->GetContentAsString().Left(200);                             break;
+        case 403: Reason = TEXT("auth failed - check HECToken and that the token is enabled");      break;
+        case 404: Reason = TEXT("not found - URL should end in /services/collector/event");         break;
+        case 503: Reason = TEXT("Splunk busy/unavailable, or HEC disabled in Global Settings");     break;
+        default:  break;
     }
-    UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkExporter: HTTP %d - %s"), Code, *Reason);
+    UE_LOG(LogSatisfactorySplunkMod, Error, TEXT("SplunkExporter: HTTP %d (failure #%d) - %s | response: %s"),
+        Code, ConsecutiveFailures, *Reason, *Response->GetContentAsString().Left(300));
 }

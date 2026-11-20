@@ -3,22 +3,26 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Dom/JsonObject.h"
-#include "Http.h"
+#include "Interfaces/IHttpRequest.h"
+#include "Interfaces/IHttpResponse.h"
 #include "SplunkExporter.generated.h"
 
 /**
  * Collects factory telemetry on independent timers and ships it to a
  * Splunk HTTP Event Collector (HEC) endpoint as batched JSON events.
  *
- * Spawned automatically by USplunkGameWorldModule when a save loads.
- * Configuration is read from Config/SatisfactorySplunkMod.ini inside the
- * installed mod folder (see LoadSettingsFromConfig).
+ * Spawned automatically by USplunkGameWorldModule when a save loads, and
+ * only does anything on the machine that owns the game state (single
+ * player, listen-server host, or dedicated server).
+ *
+ * Configuration: see LoadSettingsFromConfig() and README.md.
  *
  * Sourcetypes emitted:
+ *   satisfactory:status      - mod startup event (proves connectivity)
  *   satisfactory:summary     - aggregate counts / power / productivity
  *   satisfactory:power       - one event per power circuit
- *   satisfactory:production  - one event per manufacturer and extractor,
- *                              with throughput and a "waiting for" status
+ *   satisfactory:production  - one event per manufacturer, extractor and
+ *                              generator: throughput + "waiting for" status
  *   satisfactory:inventory   - one event per item type stored in containers
  *   satisfactory:vehicle     - trucks, trains and freight wagon cargo
  *   satisfactory:player      - player positions
@@ -36,16 +40,9 @@ protected:
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 public:
-    UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
     void StartDataCollection();
-
-    UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
     void StopDataCollection();
-
-    UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
     void FlushBuffer();
-
-    UFUNCTION(BlueprintCallable, Category = "Splunk Exporter")
     void LoadSettingsFromConfig();
 
 private:
@@ -56,15 +53,18 @@ private:
     void CollectInventory();
     void CollectVehicles();
     void CollectPlayers();
+    void SendStartupEvent();
 
     // Event helpers
-    TSharedPtr<FJsonObject> CreateEvent(const FString& SourceType) const;
+    TSharedPtr<FJsonObject> NewSplunkEvent(const FString& SourceType) const;
     void AddEventToBuffer(const TSharedPtr<FJsonObject>& EventObject);
 
     // HTTP
     void SendToSplunk(const FString& Payload, int32 EventCount);
-    void OnHttpResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful);
+    void OnHttpResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful, int32 EventCount);
 
+    // Config
+    void ApplySetting(const FString& Key, const FString& Value);
     bool IsConfigured() const;
 
 private:
@@ -78,9 +78,10 @@ private:
 
     TArray<TSharedPtr<FJsonObject>> DataBuffer;
     FString HostName;
+    FString ConfigPathUsed;
 
     // ---------------------------------------------------------------
-    // Configuration (Config/SatisfactorySplunkMod.ini)
+    // Configuration
     // ---------------------------------------------------------------
     FString SplunkURL;
     FString HECToken;
@@ -104,8 +105,9 @@ private:
     int32 MaxBufferedEvents = 2000;
 
     // Status
-    bool  bIsCollecting   = false;
-    int32 BatchesSent     = 0;
-    int32 EventsSentTotal = 0;
-    int32 EventsDropped   = 0;
+    bool  bIsCollecting    = false;
+    int32 BatchesSent      = 0;
+    int32 EventsSentTotal  = 0;
+    int32 EventsDropped    = 0;
+    int32 ConsecutiveFailures = 0;
 };

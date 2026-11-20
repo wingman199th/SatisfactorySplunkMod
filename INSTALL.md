@@ -1,139 +1,155 @@
 # Installing the Satisfactory Splunk Exporter
 
-This guide covers getting the **already-built** mod into the game and talking
-to Splunk. If you still need to compile it, see the "Building the mod"
-section in [README.md](README.md) first.
+This guide covers getting the **built** mod into the game and talking to
+Splunk. To compile it, see "Building the mod" in [README.md](README.md).
+
+> **Rebuild after game patches.** A C++ mod only loads in the game build it
+> was compiled against. If your last build is from before the current patch,
+> `git pull` the SatisfactoryModLoader project, install the engine version
+> named in its `FactoryGame.uproject` (currently `5.6.1-CSS`), and rebuild
+> before following this guide.
 
 ## Requirements
 
-- Satisfactory **1.2** (the mod targets game version ≥491125, SML 3.12+)
+- Satisfactory, current patch (mod verified against game build CL517554)
 - [Satisfactory Mod Manager (SMM)](https://smm.ficsit.app/) or a manual SML
-  install — SML **3.12.0 or newer** must be present
+  install, with SML **3.12.0 or newer**
 - A Splunk instance with an HTTP Event Collector (HEC) token
-- Clients joining your multiplayer game do **not** need the mod — it runs
-  entirely on the host/server (`AcceptsAnyRemoteVersion` is set)
+- Multiplayer clients do **not** need the mod. It only exports on the
+  host/dedicated server.
 
-## Step 1 — Install the mod files
+## Step 1: Prove Splunk works (no game needed)
 
-Pick whichever matches how you packaged it:
+1. In Splunk: **Settings → Data Inputs → HTTP Event Collector → New Token**.
+   Pick or create an events index (e.g. `satisfactory`) and copy the token.
+2. Check **HTTP Event Collector → Global Settings**: *All Tokens* must be
+   **Enabled**.
+3. **Certificate warning (the #1 failure cause):** Splunk's default HEC
+   certificate is self-signed and the game rejects it. On a home/LAN setup,
+   uncheck **Enable SSL** in the same Global Settings dialog and use an
+   `http://` URL. (Alternative: a certificate your OS trusts.)
+4. From the PC that runs the game, open PowerShell in this repository's
+   folder and run:
 
-### Option A: Alpakit copied it for you (development install)
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File tools\Test-SplunkHec.ps1 -Url http://YOUR-SPLUNK:8088/services/collector/event -Token YOUR-TOKEN
+   ```
 
-If you set your game path in Alpakit's settings and clicked **Alpakit!** with
-"Copy to game" enabled, the mod is already at:
+   This sends events exactly the way the mod does. You must see
+   `HTTP 200`. If not, the script tells you what's wrong; fix that first,
+   because the mod will hit the same error.
 
-```
-<game>\FactoryGame\Mods\SatisfactorySplunkMod\
-```
+## Step 2: Install the mod files
 
-Nothing more to copy — go to Step 2.
+### Option A: Alpakit "Copy to game"
 
-### Option B: Manual copy of the packaged mod
+If you set your game path in Alpakit and packaged with *Copy to Game*
+enabled, the mod is already at `<game>\FactoryGame\Mods\SatisfactorySplunkMod\`.
 
-Alpakit's output zip (per platform, e.g. `Windows`) lands in the modding
-project under `Saved\ArchivedPlugins\`. Extract it so the folder structure is:
+### Option B: Manual copy of the packaged zip
+
+Alpakit writes a zip per target (e.g. `Windows`) into the modding project's
+`Saved\ArchivedPlugins\` folder. Extract it so you end up with:
 
 ```
 <game>\FactoryGame\Mods\SatisfactorySplunkMod\
 ├── SatisfactorySplunkMod.uplugin
 ├── Binaries\
-├── Content\ (Paks)
+├── Content\
 └── Config\
-    └── SatisfactorySplunkMod.ini
+    ├── SatisfactorySplunkMod.ini
+    └── PluginSettings.ini
 ```
 
 Typical game locations:
 
 - Steam: `C:\Program Files (x86)\Steam\steamapps\common\Satisfactory`
-- Epic: `C:\Program Files\Epic Games\SatisfactoryEarlyAccess` (or `Satisfactory`)
+- Epic: `C:\Program Files\Epic Games\Satisfactory`
 
 ### Option C: Dedicated server
 
-Copy the same folder (use the **server platform** package from Alpakit —
-`WindowsServer` or `LinuxServer`) to the server's `FactoryGame/Mods/`
-directory. SML must be installed on the server too (SMM can manage servers,
-or use [ficsit-cli](https://github.com/satisfactorymodding/ficsit-cli)).
+Copy the **server** package (`WindowsServer` or `LinuxServer`) to the
+server's `FactoryGame/Mods/` folder. SML must be installed on the server too
+(SMM can manage servers, or use
+[ficsit-cli](https://github.com/satisfactorymodding/ficsit-cli)).
 
-## Step 2 — Set up Splunk HEC
+## Step 3: First launch creates the config file
 
-1. In Splunk: **Settings → Data Inputs → HTTP Event Collector → New Token**.
-   Pick or create an events index (e.g. `satisfactory`) and copy the token.
-2. **Certificate warning — read this, it's the #1 failure cause:** Splunk's
-   default HEC certificate is self-signed and the game's HTTP stack rejects
-   it silently. On a home/LAN setup, go to *HTTP Event Collector → Global
-   Settings* and **uncheck Enable SSL**, then use a plain `http://` URL.
-   (Alternative: front HEC with a certificate your OS trusts.)
-3. Verify from the machine that runs the game (PowerShell/cmd):
+1. Launch the game and **load a save**.
+2. The mod creates its config file at:
 
    ```
-   curl http://your-splunk:8088/services/collector/event -H "Authorization: Splunk YOUR-TOKEN" -d "{\"event\":\"test\"}"
+   <game>\FactoryGame\Configs\SatisfactorySplunkMod.ini
    ```
 
-   You must see `{"text":"Success","code":0}` before continuing.
+   and logs that it isn't configured yet. That's expected.
+3. Quit the game, open that file, set:
 
-## Step 3 — Configure the mod
+   ```ini
+   SplunkURL=http://YOUR-SPLUNK:8088/services/collector/event
+   HECToken=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+   ```
 
-Edit (create the `Config` folder if your package didn't include it):
+   (Optionally `Index=satisfactory`, if the token's default index isn't the one
+   you want.)
+4. You can re-run the Step 1 test straight from this file:
 
-```
-<game>\FactoryGame\Mods\SatisfactorySplunkMod\Config\SatisfactorySplunkMod.ini
-```
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File tools\Test-SplunkHec.ps1 -ConfigPath "<game>\FactoryGame\Configs\SatisfactorySplunkMod.ini"
+   ```
 
-Minimum required settings:
+This file lives outside the mod folder on purpose: SMM replaces the mod
+folder on every update, which would wipe your token.
 
-```ini
-[Splunk]
-SplunkURL=http://your-splunk:8088/services/collector/event
-HECToken=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-```
+**Dedicated servers:** you can skip the file and set environment variables
+instead (they override it): `SPLUNK_HEC_URL`, `SPLUNK_HEC_TOKEN`,
+`SPLUNK_HEC_INDEX`.
 
-All collection intervals and per-type on/off switches are in the same file
-with comments explaining each. Defaults are sensible for a mid-size factory;
-on mega-factories raise `ProductionInterval` to 60.
+## Step 4: Verify
 
-**Dedicated servers:** instead of the ini you can set environment variables,
-which override it — handy for containerized servers:
-
-```
-SPLUNK_HEC_URL=http://your-splunk:8088/services/collector/event
-SPLUNK_HEC_TOKEN=xxxxxxxx-....
-```
-
-## Step 4 — Verify it works
-
-1. Launch the game and **load a save** (data collection starts per-save).
+1. Launch the game and load a save.
 2. Open `<game>\FactoryGame\Saved\Logs\FactoryGame.log` and search for
-   `LogSatisfactorySplunkMod`. Healthy startup looks like:
+   `LogSatisfactorySplunkMod`. A healthy start looks like:
 
    ```
+   LogSatisfactorySplunkMod: SplunkGameWorldModule: POST_INITIALIZATION received
    LogSatisfactorySplunkMod: SplunkGameWorldModule: SplunkExporter spawned
-   LogSatisfactorySplunkMod: SplunkExporter: loaded config from ../Mods/SatisfactorySplunkMod/Config/SatisfactorySplunkMod.ini
-   LogSatisfactorySplunkMod: SplunkExporter: collection started (summary 5s, power 5s, production 30s, inventory 30s, vehicles 10s, players 10s, flush 5s)
-   LogSatisfactorySplunkMod: SplunkExporter: HTTP 200 - 1 batches / 12 events sent (0 dropped)
+   LogSatisfactorySplunkMod: SplunkExporter 2.1.0: starting up on 'YOUR-PC'
+   LogSatisfactorySplunkMod: SplunkExporter: config 'C:/.../FactoryGame/Configs/SatisfactorySplunkMod.ini' -> URL 'http://...', token 'abcd...', index '(token default)'
+   LogSatisfactorySplunkMod: SplunkExporter: collection started (summary 5s, power 5s, ...)
+   LogSatisfactorySplunkMod: SplunkExporter: HTTP 200 OK - 1 batches / 1 events sent (0 dropped)
    ```
 
-3. In Splunk, within ~30 seconds:
+   The `HTTP 200` line should appear within a second or two of loading. It's
+   the startup event.
+3. In Splunk:
 
    ```spl
-   index=satisfactory | stats count by sourcetype
+   index=* sourcetype=satisfactory:* | stats count by sourcetype
    ```
 
-   Expect six sourcetypes: `satisfactory:summary`, `satisfactory:power`,
-   `satisfactory:production`, `satisfactory:inventory`,
-   `satisfactory:vehicle`, `satisfactory:player`.
+   `satisfactory:status` appears immediately, `summary`/`power`/`player`/`vehicle`
+   after ~3 seconds, and `production`/`inventory` on their first run as well.
 
 ## Troubleshooting
 
-| Symptom in log | Cause / fix |
-|---|---|
-| No `LogSatisfactorySplunkMod` lines at all | Mod not loading — check SML is installed and the folder layout matches Step 1 |
-| `config file not found at ...` | Create `Config\SatisfactorySplunkMod.ini` at the exact path shown in the message |
-| `SplunkURL / HECToken not configured` | Values still placeholders — edit the ini or set the env vars, then restart |
-| `network error - could not reach ...` | Wrong host/port, firewall, or the self-signed HTTPS certificate (use `http://`, see Step 2) |
-| `HTTP 401/403` | Token wrong, disabled, or not allowed for the chosen index |
-| `HTTP 404` | URL path wrong — it must end in `/services/collector/event` |
-| `HTTP 400` | Index named in the ini doesn't exist / isn't allowed for the token |
-| Sends OK but nothing in searches | You're searching the wrong index — try `index=* sourcetype=satisfactory:*` |
+Find the **first** `LogSatisfactorySplunkMod` line that isn't in the healthy
+list above:
 
-Still stuck? The mod logs every failure with a specific reason — grab the
-`LogSatisfactorySplunkMod` lines and start from there.
+| Log shows | Meaning / fix |
+|---|---|
+| **No `LogSatisfactorySplunkMod` lines at all** | The mod isn't loading. Check SML is installed; search the log for `SatisfactorySplunkMod` to see if SML rejected it (wrong game version means you need to rebuild against the current patch); check the folder layout in Step 2 |
+| Mod loads but no `POST_INITIALIZATION received` | Search the log for `Discovered` and `world modules`. Send me those lines |
+| `created config file ...` then `NOT STARTED - ... placeholders` | Normal on first launch. Do Step 3 |
+| `NOT STARTED - SplunkURL must start with http://` | Fix the URL in the config |
+| `network error - could not reach ...` | Wrong host/port, firewall, or HTTPS with a self-signed cert. The Step 1 script reproduces this outside the game |
+| `HTTP 401` / `403` | Token wrong or disabled |
+| `HTTP 404` | URL must end in `/services/collector/event` |
+| `HTTP 400` | Usually the `Index` isn't allowed for this token. Clear `Index=` or allow it on the token |
+| `HTTP 503` | HEC disabled in Global Settings, or Splunk overloaded |
+| `HTTP 200 OK` but searches find nothing | Search `index=*`. The data went to the token's default index |
+| `running as a multiplayer client` | You joined someone else's game. Only the host/server exports |
+
+If you're stuck, send the `LogSatisfactorySplunkMod` lines (plus any lines
+mentioning `SatisfactorySplunkMod`). Every failure path logs a specific
+reason.
